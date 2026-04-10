@@ -1,2 +1,2 @@
 # thesis-2026
-"Projecting NBA 3-Point Percentage from Pre-NBA Data" all relevant files from the thesis.
+"Predicting Individual NBA Player 3 Point Shooting Performance from Pre-NBA Statistics" all relevant files from the thesis.
