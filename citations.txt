@@ -1,0 +1,22 @@
+MLA CITATIONS
+
+JUPYTER:
+Kluyver, Thomas, et al. "Jupyter Notebooks—A Publishing Format for Reproducible Computational Workflows." *Positioning and Power in Academic Publishing: Players, Agents and Agendas*, edited by Fernando Loizides and Birgit Schmidt, IOS Press, 2016, pp. 87-90.
+
+PANDAS:
+Munro, Rona. *Pandas*. Bloomsbury, 2015. https://doi.org/10.5040/9781784602314.00000002.
+
+NUMPY:
+Idris, Ivan. *NumPy: Beginner's Guide: Build Efficient, High-Speed Programs Using the High-Performance NumPy Mathematical Library*. Packt Publishing, 2015.
+
+GOOGLE.COLAB:
+Deza, Alfredo. *What Is Google Colab Notebooks and How Do You Share Them for Data Science Projects?* First ed., Pragmatic AI Solutions, 2022.
+
+NBA_API:
+nick-raym. "nba_api: An API Client Package to Access the APIs of NBA.com." *GitHub*, 31 Mar. 2024, https://github.com/nick-raym/nba_api.
+
+BS4:
+Richardson, Leonard. "Beautiful Soup Documentation." *GitHub*, 2007.
+
+PYTHON STANDARD LIBRARY:
+Python Software Foundation. *Python Language Reference, version 3.12.12*. 2026, https://docs.python.org/.

@@ -1,0 +1,842 @@
+---
+title: "Thesis"
+author: "Jason Leff"
+date: "2026-01-10"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(MASS)
+library(caret)
+library(glmnet)
+library(car)
+library(MLmetrics)
+library(nnet)
+library(pROC)
+library(multiROC)
+library(cluster)
+library(rms)
+library(leaps)
+library(e1071)
+library(randomForest)
+library(xgboost)
+library(factoextra)
+library(nnet)
+library(glmnetcr)
+library(ordinalNet)
+library(pracma)
+library(plotly)
+```
+
+# Setup
+```{r}
+rm(list=ls())
+data <- read.csv('data_with_pre_data.csv')
+set.seed(67)
+```
+# Initializing Functions
+```{r}
+heatmap <- function(ConfMatrix, color, title) { #Unused heatmap function
+  cm_table <- as.data.frame(ConfMatrix$table)
+ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 4) +
+  scale_fill_gradient(low = "white", high = color) +
+  theme_minimal() +
+  labs(title = paste0("Confusion Matrix Heatmap (", title, ")"),
+       x = "Actual Class", y = "Predicted Class")
+}
+```
+
+```{r}
+within_one_class_pct <- function(ConfusionMatrix) { #Unused ordinal statistic calculator
+  classes <- rownames(ConfusionMatrix)
+  n_class <- length(classes)
+  idx <- seq_len(n_class)
+  total <- sum(ConfusionMatrix)
+  count_valid <- 0
+  for (i in idx) {
+    valid_pred <- i
+    if (i == 1) {valid_pred <- c(valid_pred, 2)} 
+    else if (i == n_class) {valid_pred <- c(valid_pred, n_class - 1)} 
+    else {valid_pred <- c(valid_pred, i - 1, i + 1)}
+    count_valid <- count_valid + sum(ConfusionMatrix[i, valid_pred])
+  }
+  count_valid / total
+}
+```
+
+```{r}
+macro_auc <- function(y_true, prob_matrix) { #Used to calculate AUC for each model
+  classes <- levels(y_true)
+  aucs <- numeric(length(classes))
+  for (i in seq_along(classes)) {
+    cls <- classes[i]
+    y_binary <- as.numeric(y_true == cls)
+    p <- prob_matrix[, cls]
+
+    roc_obj <- try(roc(y_binary, p, quiet = TRUE), silent = TRUE)
+
+    if (inherits(roc_obj, "try-error") || is.null(roc_obj$auc)) {
+      aucs[i] <- NA_real_
+    } else {
+      aucs[i] <- as.numeric(roc_obj$auc)
+    }
+  }
+  mean(aucs, na.rm = TRUE)
+}
+```
+
+# Normalize to Per Minute Data
+```{r}
+normalize_stats <- function(df) {
+  nba_start <- which(names(df) == "NBA_MIN") #split the data
+  nba_end   <- which(names(df) == "PRE_G")
+  
+  for (i in (nba_start+1):(nba_end-1)) {
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) { #divide total columns by minute column
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["NBA_MIN"]]),3)
+    }
+  }
+  pre_start <- which(names(df) == "PRE_MP")
+  for (i in (pre_start+1):ncol(df)) { #repeat for college
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) {
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["PRE_MP"]]),3)
+    }
+  }
+  return(df)
+}
+per_min_data <- normalize_stats(data)
+```
+
+# PRE-NBA FT% and 3P% vs NBA 3P% filtered for 25 attempts
+```{r}
+data_filtered2 <- data %>%
+  filter(PRE_3PA >= 25 & PRE_FTA >= 25 & NBA_FG3A >= 25)
+
+clean_data <- na.omit(data_filtered2[c("PLAYER","NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+summary(model)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+colors <- rainbow(length(levels(color_factor)))[color_factor]
+s3d <- scatterplot3d(clean_data$PRE_3P_PCT, clean_data$PRE_FT_PCT, clean_data$NBA_FG3_PCT,
+                     color = colors, pch = 16,
+                     xlab = "Pre-3P%, >= 25 Attempts", ylab = "Pre-FT%, >= 25 Attempts", zlab = "NBA 3P%, >= 25 Attempts",
+                     main = "Colored by PRE_COL_OR_INT")
+s3d$plane3d(model, lty.box = "solid")
+
+legend("topright", legend = levels(color_factor), 
+       col = rainbow(length(levels(color_factor))), pch = 16)
+```
+
+
+# Initialize Train / Test Split
+```{r}
+per_min_data2 <- filter(per_min_data, NBA_MIN >= 250) # Filter out players with less than 250 min played
+# Specific set of predictors
+X <- per_min_data2[, c(8,13,38:40,42,43,45,46,48:50, 52:55, 56:66)]
+X[is.na(X)] <- 0
+y <- per_min_data2[,20] # per_min_data[,21 or 22] for 3PAPM or 3PCT
+
+df <- data.frame(X, response = y)
+df_scaled <- data.frame(scale(df[, -ncol(df)]), response = df$response)
+
+# Split train and test
+set.seed(67)
+train_index <- createDataPartition(df_scaled$response, p = 0.8, list = FALSE)
+train_data <- df_scaled[train_index, ]
+test_data  <- df_scaled[-train_index, ]
+
+x_train <- as.matrix(train_data[, -ncol(train_data)])
+y_train <- train_data$response
+x_test <- as.matrix(test_data[, -ncol(test_data)])
+y_test <- test_data$response
+```
+
+# Initializing Storing Results
+```{r}
+model_results <- data.frame(
+  Model = character(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+```
+
+# Function for calculating accuracy metrics
+```{r}
+calculate_metrics <- function(predictions, actual) {
+  rmse_val <- sqrt(mean((predictions - actual)^2))
+  mae_val <- mean(abs(predictions - actual))
+  r2_val <- 1 - sum((actual - predictions)^2) / sum((actual - mean(actual))^2)
+  return(c(rmse_val, mae_val, r2_val))
+}
+```
+
+# Linear Regression
+```{r}
+lm_model <- lm(response ~ ., data = train_data)
+lm_pred <- predict(lm_model, newdata = test_data)
+lm_metrics <- calculate_metrics(lm_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Linear Regression (OLS)",
+  RMSE = lm_metrics[1],
+  MAE = lm_metrics[2],
+  R2 = lm_metrics[3]
+))
+```
+
+
+
+# OLS with CV
+```{r}
+set.seed(67)
+cv_folds <- createFolds(train_data$response, k = 10)
+cv_rmse_ols <- numeric(10)
+cv_mae_ols <- numeric(10)
+cv_r2_ols <- numeric(10)
+
+for(i in 1:10) {
+  train_fold <- train_data[-cv_folds[[i]], ]
+  valid_fold <- train_data[cv_folds[[i]], ]
+  
+  fold_model <- lm(response ~ ., data = train_fold)
+  fold_pred <- predict(fold_model, newdata = valid_fold)
+  
+  cv_rmse_ols[i] <- sqrt(mean((fold_pred - valid_fold$response)^2))
+  cv_mae_ols[i] <- mean(abs(fold_pred - valid_fold$response))
+  cv_r2_ols[i] <- 1 - sum((valid_fold$response - fold_pred)^2) / 
+    sum((valid_fold$response - mean(valid_fold$response))^2)
+}
+```
+
+```{r}
+# 1. QUADRATIC VERSION OF THE MODEL
+# Add quadratic terms to the data
+create_quadratic_features <- function(data) {
+  # Keep the response variable
+  response <- data$response
+  
+  # Get predictors only
+  predictors <- data[, -which(names(data) == "response")]
+  
+  # Create quadratic terms
+  quadratic_terms <- predictors^2
+  
+  # Name the quadratic terms
+  colnames(quadratic_terms) <- paste0(names(predictors), "_sq")
+  
+  # Combine original and quadratic terms
+  quadratic_data <- cbind(predictors, quadratic_terms, response = response)
+  
+  return(quadratic_data)
+}
+
+# Create quadratic versions of train and test data
+train_data_quad <- create_quadratic_features(train_data)
+test_data_quad <- create_quadratic_features(test_data)
+
+# Linear Regression with Quadratic Terms
+lm_quad <- lm(response ~ ., data = train_data_quad)
+lm_quad_pred <- predict(lm_quad, newdata = test_data_quad)
+lm_quad_metrics <- calculate_metrics(lm_quad_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Quadratic OLS",
+  RMSE = lm_quad_metrics[1],
+  MAE = lm_quad_metrics[2],
+  R2 = lm_quad_metrics[3]
+))
+```
+```{r}
+# 2. GNLR LOGISTIC MODEL FUNCTION
+gnlr_logistic <- function(X, y, max_iter = 100, tol = 1e-6, 
+                          weight_strategy = "density", 
+                          kernel_bandwidth = 0.5) {
+  # Transform response to logistic scale (assuming y is between 0 and 1)
+  # If not, normalize to [0,1]
+  eps <- 1e-6
+  y_min <- min(y)
+  y_max <- max(y)
+  y_scaled <- (y - y_min) / (y_max - y_min)
+
+  y_scaled <- pmin(pmax(y_scaled, eps), 1 - eps)
+
+  y_logit <- log(y_scaled / (1 - y_scaled))
+
+  
+  # Initial OLS on log-odds (step 4)
+  lm_logit <- lm(y_logit ~ X)
+  beta <- coef(lm_logit)
+  
+  # Initialize weights
+  n <- length(y)
+  weights <- rep(1, n)
+  
+  # IRLS algorithm
+  for(iter in 1:max_iter) {
+    beta_old <- beta
+    
+    # Calculate current predictions on log-odds scale
+    X_design <- cbind(1, X)  # Add intercept
+    eta <- X_design %*% beta
+    
+    # Convert back to probability scale
+    p <- 1 / (1 + exp(-eta))
+    p <- as.numeric(p)                     # ← critical fix
+    p <- pmin(pmax(p, 1e-10), 1 - 1e-10)
+
+    
+    # Calculate weights based on strategy
+    if(weight_strategy == "density") {
+      # Weight based on data point density (kernel density estimation)
+      if(iter == 1) {
+        # Initial equal weights
+        w <- rep(1, n)
+      } else {
+        # Calculate kernel density weights
+        kde_weights <- function(x, data, bandwidth) {
+          distances <- abs(data - x)
+          weights <- exp(-distances^2 / (2 * bandwidth^2))
+          return(mean(weights))
+        }
+        
+        # Apply kernel density weighting to predictions
+        density_weights <- sapply(p, kde_weights, data = p, bandwidth = kernel_bandwidth)
+        w <- density_weights * p * (1 - p)
+      }
+    } else if(weight_strategy == "variance") {
+      # Standard GLM weights for logistic regression
+      w <- p * (1 - p)
+    } else {
+      w <- rep(1, n)
+    }
+    
+    # Working response for IRLS
+    z <- eta + (y_scaled - p) / (p * (1 - p) + 1e-10)
+    
+    # Weighted least squares update
+    W <- diag(w)
+    XWX <- t(X_design) %*% W %*% X_design
+    XWz <- t(X_design) %*% W %*% z
+    
+    # Solve for new beta with regularization for stability
+    beta <- solve(XWX + diag(1e-6, ncol(X_design))) %*% XWz
+    
+    # Check convergence
+    if(max(abs(beta - beta_old)) < tol) {
+      cat(sprintf("Converged after %d iterations\n", iter))
+      break
+    }
+  }
+  
+  # Final predictions on probability scale
+  eta_final <- cbind(1, X) %*% beta
+  p_final <- 1 / (1 + exp(-eta_final))
+  
+  # Convert back to original scale
+  predictions <- p_final * (y_max - y_min) + y_min
+  
+  return(list(
+    coefficients = beta,
+    predictions = predictions,
+    log_odds = eta_final,
+    probabilities = p_final,
+    weights = w
+  ))
+}
+```
+```{r}
+# 3. APPLY GNLR LOGISTIC MODEL
+# Prepare data matrices
+X_train_mat <- as.matrix(train_data[, -ncol(train_data)])
+X_test_mat <- as.matrix(test_data[, -ncol(test_data)])
+
+# Fit GNLR model with density-based weighting
+gnlr_fit <- gnlr_logistic(X_train_mat, y_train, 
+                           weight_strategy = "density",
+                           kernel_bandwidth = 0.3)
+
+# Make predictions on test set
+# For test predictions, we need to apply the learned coefficients
+X_test_design <- cbind(1, X_test_mat)
+eta_test <- X_test_design %*% gnlr_fit$coefficients
+p_test <- 1 / (1 + exp(-eta_test))
+
+# Transform back to original scale
+y_min <- min(y_train)
+y_max <- max(y_train)
+gnlr_pred <- p_test * (y_max - y_min) + y_min
+
+gnlr_metrics <- calculate_metrics(gnlr_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "GNLR Logistic (Density-weighted)",
+  RMSE = gnlr_metrics[1],
+  MAE = gnlr_metrics[2],
+  R2 = gnlr_metrics[3]
+))
+```
+```{r}
+# 4. QUADRATIC GNLR MODEL
+# Create quadratic feature matrices
+X_train_quad_mat <- as.matrix(train_data_quad[, -ncol(train_data_quad)])
+X_test_quad_mat <- as.matrix(test_data_quad[, -ncol(test_data_quad)])
+
+# Fit quadratic GNLR
+gnlr_quad_fit <- gnlr_logistic(X_train_quad_mat, y_train,
+                                weight_strategy = "density",
+                                kernel_bandwidth = 0.3)
+
+# Predict with quadratic GNLR
+X_test_quad_design <- cbind(1, X_test_quad_mat)
+eta_test_quad <- X_test_quad_design %*% gnlr_quad_fit$coefficients
+p_test_quad <- 1 / (1 + exp(-eta_test_quad))
+gnlr_quad_pred <- p_test_quad * (y_max - y_min) + y_min
+
+gnlr_quad_metrics <- calculate_metrics(gnlr_quad_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Quadratic GNLR Logistic",
+  RMSE = gnlr_quad_metrics[1],
+  MAE = gnlr_quad_metrics[2],
+  R2 = gnlr_quad_metrics[3]
+))
+```
+```{r}
+# 5. VISUALIZE WEIGHTS AND DENSITY
+# Plot showing weight distribution based on density
+plot_weight_density <- function(gnlr_fit, y_train, title = "GNLR Density Weighting") {
+  y_scaled <- (y_train - min(y_train)) / (max(y_train) - min(y_train))
+  
+  par(mfrow = c(1, 2))
+  
+  # Plot 1: Weights vs. Predictions
+  plot(gnlr_fit$probabilities, gnlr_fit$weights,
+       xlab = "Predicted Probability", ylab = "Weight",
+       main = paste(title, "\nWeights vs Predictions"),
+       pch = 19, col = rgb(0, 0, 1, 0.5))
+  grid()
+  
+  # Plot 2: Density of predictions with weights
+  dens <- density(gnlr_fit$probabilities, weights = gnlr_fit$weights/sum(gnlr_fit$weights))
+  hist(gnlr_fit$probabilities, breaks = 30, freq = FALSE,
+       main = paste(title, "\nWeighted Density"),
+       xlab = "Predicted Probability", col = "lightblue")
+  lines(dens, col = "red", lwd = 2)
+  
+  par(mfrow = c(1, 1))
+}
+
+# Create plots
+plot_weight_density(gnlr_fit, y_train, "GNLR Logistic Model")
+plot_weight_density(gnlr_quad_fit, y_train, "Quadratic GNLR Model")
+```
+```{r}
+# 6. COMPARE ALL MODELS
+# Add regular OLS for comparison
+lm_simple <- lm(response ~ ., data = train_data)
+lm_simple_pred <- predict(lm_simple, newdata = test_data)
+lm_simple_metrics <- calculate_metrics(lm_simple_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Linear Regression (Simple OLS)",
+  RMSE = lm_simple_metrics[1],
+  MAE = lm_simple_metrics[2],
+  R2 = lm_simple_metrics[3]
+))
+
+# Sort by RMSE
+model_results <- model_results[order(model_results$RMSE), ]
+
+# Print results
+cat("\n=== FINAL MODEL COMPARISON ===\n")
+print(model_results)
+cat("\n")
+```
+```{r}
+# 7. CROSS-VALIDATION FOR GNLR
+set.seed(67)
+cv_folds <- createFolds(y_train, k = 5)
+cv_rmse_gnlr <- numeric(5)
+cv_rmse_gnlr_quad <- numeric(5)
+
+for(i in 1:5) {
+  # Split fold data
+  train_idx <- unlist(cv_folds[-i])
+  valid_idx <- cv_folds[[i]]
+  
+  X_train_fold <- as.matrix(train_data[train_idx, -ncol(train_data)])
+  y_train_fold <- y_train[train_idx]
+  X_valid_fold <- as.matrix(train_data[valid_idx, -ncol(train_data)])
+  y_valid_fold <- y_train[valid_idx]
+  
+  # Regular GNLR
+  gnlr_cv_fit <- gnlr_logistic(X_train_fold, y_train_fold, 
+                                weight_strategy = "density",
+                                kernel_bandwidth = 0.3)
+  
+  X_valid_design <- cbind(1, X_valid_fold)
+  eta_valid <- X_valid_design %*% gnlr_cv_fit$coefficients
+  p_valid <- 1 / (1 + exp(-eta_valid))
+  y_min_fold <- min(y_train_fold)
+  y_max_fold <- max(y_train_fold)
+  gnlr_cv_pred <- p_valid * (y_max_fold - y_min_fold) + y_min_fold
+  
+  cv_rmse_gnlr[i] <- sqrt(mean((gnlr_cv_pred - y_valid_fold)^2))
+  
+  # Quadratic GNLR
+  train_data_quad_fold <- create_quadratic_features(train_data[train_idx, ])
+  valid_data_quad_fold <- create_quadratic_features(train_data[valid_idx, ])
+  
+  X_train_quad_fold <- as.matrix(train_data_quad_fold[, -ncol(train_data_quad_fold)])
+  X_valid_quad_fold <- as.matrix(valid_data_quad_fold[, -ncol(valid_data_quad_fold)])
+  
+  gnlr_quad_cv_fit <- gnlr_logistic(X_train_quad_fold, y_train_fold,
+                                     weight_strategy = "density",
+                                     kernel_bandwidth = 0.3)
+  
+  X_valid_quad_design <- cbind(1, X_valid_quad_fold)
+  eta_valid_quad <- X_valid_quad_design %*% gnlr_quad_cv_fit$coefficients
+  p_valid_quad <- 1 / (1 + exp(-eta_valid_quad))
+  gnlr_quad_cv_pred <- p_valid_quad * (y_max_fold - y_min_fold) + y_min_fold
+  
+  cv_rmse_gnlr_quad[i] <- sqrt(mean((gnlr_quad_cv_pred - y_valid_fold)^2))
+}
+
+cat("=== CROSS-VALIDATION RESULTS ===\n")
+cat(sprintf("GNLR Logistic (5-fold CV RMSE): %.4f ± %.4f\n", 
+            mean(cv_rmse_gnlr), sd(cv_rmse_gnlr)))
+cat(sprintf("Quadratic GNLR (5-fold CV RMSE): %.4f ± %.4f\n",
+            mean(cv_rmse_gnlr_quad), sd(cv_rmse_gnlr_quad)))
+```
+```{r}
+# 8. SUMMARIZE KEY FINDINGS
+cat("\n=== KEY FINDINGS ===\n")
+cat("1. Quadratic terms capture non-linear relationships\n")
+cat("2. GNLR transforms to log-odds space for modeling\n")
+cat("3. IRLS uses weighted least squares with density-based weights\n")
+cat("4. Model automatically adapts weights to data density\n")
+cat("5. Quadratic GNLR often performs best for complex patterns\n")
+
+# Return coefficients for interpretation
+cat("\n=== TOP 10 COEFFICIENTS (Quadratic GNLR) ===\n")
+coef_df <- data.frame(
+  Variable = c("Intercept", colnames(X_train_quad_mat)),
+  Coefficient = as.numeric(gnlr_quad_fit$coefficients)
+)
+coef_df$Importance <- abs(coef_df$Coefficient)
+print(coef_df[order(-coef_df$Importance), ][1:10, ])
+```
+
+
+```{r}
+model_results <- rbind(model_results, 
+  data.frame(
+    Model = "Linear Regression (10-fold CV)",
+    RMSE = mean(cv_rmse_ols),
+    MAE = mean(cv_mae_ols),
+    R2 = mean(cv_r2_ols)
+))
+
+cat("\n=== MODEL RESULTS ===\n")
+print(model_results[order(model_results$RMSE), ])
+```
+
+can you find what the issues are with the gnlr model and why it produces the poor model results statistics?
+
+# OLS results
+```{r}
+final_ols <- lm(response ~ ., data = train_data)
+par(mfrow = c(2, 2))
+plot(final_ols)
+par(mfrow = c(1, 1))
+library(ggplot2)
+
+ggplot(data.frame(
+  fitted = fitted(final_ols),
+  resid = resid(final_ols)
+), aes(x = fitted, y = resid)) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_hline(yintercept = 0, color = "red", linewidth = 1) +
+  labs(
+    title = "Fitted vs Residuals",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+```{r}
+final_ols_model <- lm(response ~ ., data = train_data)
+test_pred <- predict(final_ols_model, newdata = test_data)
+
+# Create a dataframe for plotting
+plot_data <- data.frame(
+  Actual = y_test,
+  Predicted = test_pred,
+  Residual = y_test - test_pred,
+  Abs_Residual = abs(y_test - test_pred)
+)
+
+# Add player names if available
+if("PLAYER" %in% names(per_min_data2)) {
+  plot_data$Player <- per_min_data2$PLAYER[-train_index]
+} else {
+  plot_data$Player <- paste("Player", 1:nrow(plot_data))
+}
+
+# Add cluster info if available
+if("Cluster3Shooting_recordered" %in% names(per_min_data2)) {
+  plot_data$Cluster <- per_min_data2$Cluster3Shooting_recordered[-train_index]
+}
+
+metrics_text <- paste(
+  "<b>Model Performance Metrics</b><br>",
+  "RMSE: ", round(sqrt(mean(plot_data$Residual^2)), 5), "<br>",
+  "MAE: ", round(mean(abs(plot_data$Residual)), 5), "<br>",
+  "R²: ", round(1 - sum(plot_data$Residual^2) / 
+                sum((plot_data$Actual - mean(plot_data$Actual))^2), 4), "<br>",
+  "Correlation: ", round(cor(plot_data$Actual, plot_data$Predicted), 4), "<br>",
+  "Mean Error: ", round(mean(plot_data$Residual), 5), "<br>",
+  "Std Error: ", round(sd(plot_data$Residual), 5), "<br><br>",
+  "<b>Test Set Info</b><br>",
+  "Number of players: ", nrow(plot_data), "<br>",
+  "Actual range: [", round(min(plot_data$Actual), 3), ", ", 
+                    round(max(plot_data$Actual), 3), "]<br>",
+  "Predicted range: [", round(min(plot_data$Predicted), 3), ", ", 
+                      round(max(plot_data$Predicted), 3), "]"
+)
+
+p7 <- plot_ly() %>%
+  add_annotations(
+    text = metrics_text,
+    x = 0.5, y = 0.5,
+    xref = "paper", yref = "paper",
+    showarrow = FALSE,
+    font = list(size = 14),
+    align = "left",
+    bgcolor = "white",
+    bordercolor = "black",
+    borderwidth = 2
+  ) %>%
+  layout(title = "Model Performance Summary",
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+```
+
+p7
+
+
+
+```{r}
+test_index  <- setdiff(seq_len(nrow(per_min_data2)), train_index)
+
+# Build full_data from train/test
+full_data <- rbind(train_data, test_data)
+
+# Fit OLS model on training data
+full_ols_model <- lm(response ~ ., data = train_data)
+full_pred <- predict(full_ols_model, newdata = full_data)
+
+# Get actual values and residuals
+full_actual <- full_data$response
+full_residuals <- full_actual - full_pred
+full_abs_residuals <- abs(full_residuals)
+
+# Create base plot dataframe
+full_plot_data <- data.frame(
+  Actual      = full_actual,
+  Predicted   = full_pred,
+  Residual    = full_residuals,
+  Abs_Residual= full_abs_residuals
+)
+
+# Attach player names and clusters directly from per_min_data2
+full_plot_data$Player <- per_min_data2$PLAYER[c(train_index, test_index)]
+
+if("Cluster3Shooting_recordered" %in% names(per_min_data2)) {
+  full_plot_data$Cluster <- per_min_data2$Cluster3Shooting_recordered[c(train_index, test_index)]
+}
+
+# Add data split indicator using indices
+full_plot_data$Data_Split <- c(
+  rep("Training", length(train_index)),
+  rep("Test", length(test_index))
+)
+
+
+# Add cluster info if available
+if("Cluster3Shooting_recordered" %in% names(per_min_data2)) {
+  full_plot_data$Cluster <- per_min_data2$Cluster3Shooting_recordered
+}
+
+# Calculate metrics
+rmse_full <- sqrt(mean(full_plot_data$Residual^2))
+r2_full <- 1 - sum(full_plot_data$Residual^2) / 
+  sum((full_plot_data$Actual - mean(full_plot_data$Actual))^2)
+
+# P1: Actual vs Predicted (Full Dataset) - FIXED VERSION
+p1_full <- plot_ly() %>%
+  # Add scatter points
+  add_trace(data = full_plot_data, 
+            x = ~Actual, y = ~Predicted,
+            type = 'scatter', mode = 'markers',
+            color = ~Data_Split,
+            colors = c('blue', 'orange'),
+            marker = list(size = 8, opacity = 0.7),
+            hoverinfo = 'text',
+            text = ~paste('Player: ', Player,
+                         '<br>Split: ', Data_Split,
+                         '<br>Actual: ', round(Actual, 4),
+                         '<br>Predicted: ', round(Predicted, 4),
+                         '<br>Residual: ', round(Residual, 4)),
+            name = ~Data_Split) %>%
+  # Add perfect fit line (separate trace with its own data)
+  add_trace(x = c(min(full_plot_data$Actual), max(full_plot_data$Actual)), 
+            y = c(min(full_plot_data$Actual), max(full_plot_data$Actual)),
+            type = 'scatter', mode = 'lines',
+            line = list(color = 'red', width = 2, dash = 'solid'),
+            name = 'Perfect Fit',
+            showlegend = TRUE) %>%
+  layout(title = 'Actual vs Predicted (Full Dataset)',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'),
+         legend = list(x = 0.02, y = 0.98))
+
+# Add performance metrics annotation
+p1_full <- p1_full %>%
+  add_annotations(
+    text = paste("Full Dataset:<br>RMSE =", round(rmse_full, 5), 
+                "<br>R² =", round(r2_full, 4)),
+    x = 0.98, y = 0.02,
+    xref = "paper", yref = "paper",
+    showarrow = FALSE,
+    font = list(size = 12),
+    align = "right",
+    bgcolor = "rgba(255, 255, 255, 0.8)",
+    bordercolor = "black",
+    borderwidth = 1
+  )
+
+# P2: Color by residual magnitude (Full Dataset) - FIXED VERSION
+p2_full <- plot_ly() %>%
+  add_trace(data = full_plot_data, 
+            x = ~Actual, y = ~Predicted,
+            type = 'scatter', mode = 'markers',
+            marker = list(
+              size = 8, 
+              opacity = 0.8,
+              color = ~Abs_Residual,
+              colorscale = list(c(0, 1), c('lightblue', 'darkblue')),
+              showscale = TRUE,
+              colorbar = list(title = "|Error|")
+            ),
+            hoverinfo = 'text',
+            text = ~paste('Player: ', Player,
+                         '<br>Split: ', Data_Split,
+                         '<br>Actual: ', round(Actual, 4),
+                         '<br>Predicted: ', round(Predicted, 4),
+                         '<br>|Error|: ', round(Abs_Residual, 4)),
+            name = 'Predictions') %>%
+  add_trace(x = c(min(full_plot_data$Actual), max(full_plot_data$Actual)), 
+            y = c(min(full_plot_data$Actual), max(full_plot_data$Actual)),
+            type = 'scatter', mode = 'lines',
+            line = list(color = 'red', width = 2, dash = 'dash'),
+            name = 'Perfect Fit') %>%
+  layout(title = 'Colored by Error Magnitude (Full Dataset)',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'))
+
+# P5: Histogram of residuals (Full Dataset) - SIMPLER VERSION
+# Calculate histogram data manually
+p5_full <- plot_ly(full_plot_data, x = ~Actual, y = ~Predicted, z = ~Abs_Residual,
+              type = 'scatter3d', mode = 'markers',
+              marker = list(size = 5, opacity = 0.8,
+                           color = ~Abs_Residual,
+                           colorscale = 'blues'),
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player,
+                           '<br>Actual: ', round(Actual, 4),
+                           '<br>Predicted: ', round(Predicted, 4),
+                           '<br>|Error|: ', round(Abs_Residual, 4))) %>%
+  layout(title = '3D: Actual vs Predicted vs Error',
+         scene = list(
+           xaxis = list(title = 'Actual'),
+           yaxis = list(title = 'Predicted'),
+           zaxis = list(title = 'Absolute Error')
+         ))
+```
+```{r}
+# Display the plots
+cat("=== FULL DATASET PLOTS ===\n")
+cat("Displaying p1_full...\n")
+p1_full
+
+cat("\nDisplaying p2_full...\n")
+p2_full
+
+cat("\nDisplaying p5_full...\n")
+p5_full
+```
+
+# Create a simple comparison table in console
+cat("\n=== PERFORMANCE METRICS ===\n")
+cat(sprintf("%-15s %6s %10s %10s %8s\n", "Dataset", "N", "RMSE", "MAE", "R²"))
+cat(rep("-", 50), "\n")
+
+train_idx <- full_plot_data$Data_Split == "Training"
+test_idx <- full_plot_data$Data_Split == "Test"
+
+metrics <- data.frame(
+  Dataset = c("Training", "Test", "Full"),
+  N = c(sum(train_idx), sum(test_idx), nrow(full_plot_data)),
+  RMSE = c(
+    sqrt(mean(full_plot_data$Residual[train_idx]^2)),
+    sqrt(mean(full_plot_data$Residual[test_idx]^2)),
+    rmse_full
+  ),
+  MAE = c(
+    mean(abs(full_plot_data$Residual[train_idx])),
+    mean(abs(full_plot_data$Residual[test_idx])),
+    mean(abs(full_plot_data$Residual))
+  ),
+  R2 = c(
+    1 - sum(full_plot_data$Residual[train_idx]^2) / 
+      sum((full_plot_data$Actual[train_idx] - mean(full_plot_data$Actual[train_idx]))^2),
+    1 - sum(full_plot_data$Residual[test_idx]^2) / 
+      sum((full_plot_data$Actual[test_idx] - mean(full_plot_data$Actual[test_idx]))^2),
+    r2_full
+  )
+)
+
+for(i in 1:nrow(metrics)) {
+  cat(sprintf("%-15s %6d %10.5f %10.5f %8.4f\n", 
+              metrics$Dataset[i], 
+              metrics$N[i], 
+              metrics$RMSE[i], 
+              metrics$MAE[i], 
+              metrics$R2[i]))
+}
+
+# Save individual plots
+htmlwidgets::saveWidget(p1_full, "p1_full_dataset.html")
+htmlwidgets::saveWidget(p2_full, "p2_full_dataset.html")
+htmlwidgets::saveWidget(p5_full, "p5_full_dataset.html")
+
+cat("\nPlots saved as:\n")
+cat("1. p1_full_dataset.html\n")
+cat("2. p2_full_dataset.html\n")
+cat("3. p5_full_dataset.html\n")
+
+

@@ -1,0 +1,689 @@
+---
+title: "Thesis"
+author: "Jason Leff"
+date: "2025-09-19"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(MASS)
+library(caret)
+library(glmnet)
+library(car)
+library(MLmetrics)
+library(nnet)
+library(pROC)
+library(multiROC)
+library(cluster)
+library(rms)
+```
+
+```{r}
+rm(list=ls())
+data <- read.csv('data_with_pre_data.csv')
+```
+```{r}
+head(data)
+```
+
+# Simple Linear Model Predicting 3 Point Percentage from Pre-NBA Free Throw Percentage
+```{r}
+FTto3 <- lm(NBA_FG3_PCT ~ PRE_FT_PCT, data = data)
+summary(FTto3)
+```
+```{r}
+plot(data$PRE_FT_PCT,data$NBA_FG3_PCT)
+```
+```{r}
+ggplot(data, aes(x = PRE_FT_PCT, y = NBA_FG3_PCT)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "PRE_FT_PCT", y = "NBA_FG3_PCT") +
+  theme_minimal()
+```
+```{r}
+data_filtered <- data %>%
+  filter(PRE_FTA > 25 & NBA_FG3A > 25)
+
+ggplot(data_filtered, aes(x = PRE_FT_PCT, y = NBA_FG3_PCT)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.2) +
+  labs(
+    x = "Pre-NBA Free Throw Percentage", 
+    y = "NBA 3-Point Percentage",
+    title = "Free Throw % vs 3-Point % (Min. 25 Attempts Each)",
+    subtitle = paste("n =", nrow(data_filtered), "players")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+# Simple Linear Model Predicting 3 Point Percentage from Pre-NBA 3 Point Percentage
+```{r}
+Pre3toNBA3 <- lm(NBA_FG3_PCT ~ PRE_3P_PCT, data = data)
+summary(Pre3toNBA3)
+```
+
+```{r}
+data_filtered <- data %>%
+  filter(PRE_3PA > 25 & NBA_FG3A > 25)
+
+ggplot(data_filtered, aes(x = PRE_3P_PCT, y = NBA_FG3_PCT, color = PRE_COL_or_INT)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", alpha = 0.05) +
+  labs(
+    x = "Pre-NBA Three Point Percentage", 
+    y = "NBA 3-Point Percentage",
+    title = "Pre-NBA 3-Point % vs NBA 3-Point % (Min. 25 Attempts Each)",
+    subtitle = paste("n =", nrow(data_filtered), "players")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+#ANOVA INTERNATIONAL VS COLLEGE
+# MLR of both PRE-NBA FT% and 3P% vs NBA 3P%
+```{r}
+FT3P_to_NBA3 <- lm(NBA_FG3_PCT ~ PRE_3P_PCT+PRE_FT_PCT, data=data)
+summary(FT3P_to_NBA3)
+```
+```{r}
+clean_data <- na.omit(data[c("NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+colors <- rainbow(length(levels(color_factor)))[color_factor]
+s3d <- scatterplot3d(clean_data$PRE_3P_PCT, clean_data$PRE_FT_PCT, clean_data$NBA_FG3_PCT,
+                     color = colors, pch = 16,
+                     xlab = "Pre-3P%", ylab = "Pre-FT%", zlab = "NBA 3P%",
+                     main = "Colored by PRE_COL_OR_INT")
+s3d$plane3d(model, lty.box = "solid")
+
+legend("topright", legend = levels(color_factor), 
+       col = rainbow(length(levels(color_factor))), pch = 16)
+```
+# MLR of both PRE-NBA FT% and 3P% vs NBA 3P% filtered for 25 attempts
+```{r}
+data_filtered2 <- data %>%
+  filter(PRE_3PA >= 25 & PRE_FTA >= 25 & NBA_FG3A >= 25)
+
+clean_data <- na.omit(data_filtered2[c("PLAYER","NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+summary(model)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+colors <- rainbow(length(levels(color_factor)))[color_factor]
+s3d <- scatterplot3d(clean_data$PRE_3P_PCT, clean_data$PRE_FT_PCT, clean_data$NBA_FG3_PCT,
+                     color = colors, pch = 16,
+                     xlab = "Pre-3P%, >= 25 Attempts", ylab = "Pre-FT%, >= 25 Attempts", zlab = "NBA 3P%, >= 25 Attempts",
+                     main = "Colored by PRE_COL_OR_INT")
+s3d$plane3d(model, lty.box = "solid")
+
+legend("topright", legend = levels(color_factor), 
+       col = rainbow(length(levels(color_factor))), pch = 16)
+```
+```{r}
+library(plotly)
+
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+
+x_seq <- seq(min(clean_data$PRE_3P_PCT), max(clean_data$PRE_3P_PCT), length.out = 30)
+y_seq <- seq(min(clean_data$PRE_FT_PCT), max(clean_data$PRE_FT_PCT), length.out = 30)
+
+grid <- expand.grid(PRE_3P_PCT = x_seq, PRE_FT_PCT = y_seq)
+grid$NBA_FG3_PCT <- predict(model, newdata = grid)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+
+plot_ly() %>%
+  add_markers(
+    data = clean_data,
+    x = ~PRE_3P_PCT,
+    y = ~PRE_FT_PCT,
+    z = ~NBA_FG3_PCT,
+    color = color_factor,
+    marker = list(size = 4),
+    hoverinfo = "text",
+    text = ~paste(
+      "Name:", PLAYER,
+      "<br>Pre-3P%:", PRE_3P_PCT,
+      "<br>Pre-FT%:", PRE_FT_PCT,
+      "<br>NBA 3P%:", NBA_FG3_PCT,
+      "<br>Group:", PRE_COL_or_INT
+    )
+  ) %>%
+  add_surface(
+    x = x_seq,
+    y = y_seq,
+    z = matrix(grid$NBA_FG3_PCT, nrow = length(x_seq), ncol = length(y_seq)),
+    opacity = 0.5,
+    showscale = FALSE
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Pre-3P% (>= 25 Attempts)"),
+      yaxis = list(title = "Pre-FT% (>= 25 Attempts)"),
+      zaxis = list(title = "NBA 3P% (>= 25 Attempts)")
+    ),
+    title = "Interactive 3D Regression: NBA 3P% vs Pre-3P% & Pre-FT%"
+  )
+```
+
+# Classification of Shooting Ability in the NBA
+```{r}
+data$NBA_3PAPG <- round(data$NBA_FG3A / data$NBA_GP, 3)
+
+
+data$NBA_3PAPG[is.infinite(data$NBA_3PAPG)] <- NA
+data$NBA_3PAPG[is.nan(data$NBA_3PAPG)] <- NA
+
+classify_3pm <- function(three_ppg) {
+  ifelse(is.na(three_ppg), "BAD",
+  ifelse(three_ppg >= quantile(three_ppg, 0.80, na.rm = TRUE), "GREAT",
+  ifelse(three_ppg >= quantile(three_ppg, 0.60, na.rm = TRUE), "GOOD",
+  ifelse(three_ppg >= quantile(three_ppg, 0.40, na.rm = TRUE), "AVERAGE",
+  ifelse(three_ppg >= quantile(three_ppg, 0.20, na.rm = TRUE), "POOR", "BAD")))))
+}
+
+data$NBA_3PM_CLASS <- classify_3pm(data$NBA_3PAPG)
+data$NBA_FG3_PCT_CLASS <- classify_3pm(data$NBA_FG3_PCT)
+```
+
+# Clustering to Create Classes
+```{r}
+clust_data <- na.omit(data[, c("NBA_3PAPG", "NBA_FG3_PCT")])
+clust_data_scaled <- scale(clust_data)
+wss <- numeric(6)
+
+for (k in 1:8) {
+  set.seed(123)
+  km <- kmeans(clust_data_scaled, centers = k, nstart = 25)
+  wss[k] <- km$tot.withinss
+}
+
+plot(1:8, wss, type = "b", pch=19,
+     xlab = "Number of clusters K",
+     ylab = "Total within-clusters sum of squares",
+     main = "Elbow Method for Optimal K")
+
+set.seed(123)
+best_k <- 3
+km_best <- kmeans(clust_data_scaled, centers = best_k, nstart = 25)
+
+library(ggplot2)
+clust_plot <- data.frame(clust_data, cluster = factor(km_best$cluster))
+
+ggplot(clust_plot, aes(x = NBA_3PAPG, y = NBA_FG3_PCT, color = cluster)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = paste("K-means Clustering with K =", best_k)) +
+  theme_minimal()
+```
+```{r}
+clust_data <- na.omit(data[, c("NBA_3PAPG", "NBA_FG3_PCT")])
+clust_data_scaled <- scale(clust_data)
+d <- dist(clust_data_scaled)
+hc <- hclust(d, method = "ward.D2")
+plot(hc, labels = FALSE, hang = -1, main = "Hierarchical Clustering Dendrogram")
+
+library(cluster)
+
+sil_width <- numeric(8)
+
+for (k in 2:8) {
+  clusters <- cutree(hc, k)
+  ss <- silhouette(clusters, d)
+  sil_width[k] <- mean(ss[, 3])
+}
+
+plot(2:8, sil_width[2:8], type = "b", pch = 19,
+     xlab = "Number of clusters k",
+     ylab = "Average silhouette width",
+     main = "Silhouette Method for Hierarchical Clustering")
+```
+```{r}
+best_k <- which.max(sil_width)
+clusters_best <- cutree(hc, k = best_k)
+
+library(ggplot2)
+clust_plot <- data.frame(clust_data, cluster = factor(clusters_best))
+
+ggplot(clust_plot, aes(x = NBA_3PAPG, y = NBA_FG3_PCT, color = cluster)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = paste("Hierarchical Clustering with k =", best_k)) +
+  theme_minimal()
+```
+
+
+
+```{r}
+x <- na.omit(data$NBA_3PAPG)
+x_scaled <- scale(x)
+d <- dist(x_scaled)
+hc <- hclust(d, method = "ward.D2")
+plot(hc, labels = FALSE, hang = -1,
+     main = "Hierarchical Clustering Dendrogram (NBA_3PAPG)")
+sil_width <- numeric(20)
+
+for (k in 3:6) {
+  clusters <- cutree(hc, k)
+  ss <- silhouette(clusters, d)
+  sil_width[k] <- mean(ss[, 3])
+}
+
+plot(3:6, sil_width[3:6], type = "b", pch = 19,
+     xlab = "Number of clusters k",
+     ylab = "Average silhouette width",
+     main = "Silhouette Method (NBA_3PAPG)")
+```
+```{r}
+best_k <- which.max(sil_width)
+clusters_best <- cutree(hc, k = best_k)
+
+plot(x, rep(0, length(x)), col = clusters_best, pch = 19,
+     xlab = "NBA_3PAPG", ylab = "",
+     yaxt = "n", main = paste("Hierarchical Clustering on NBA_3PAPG (k =", best_k, ")"))
+```
+```{r}
+x <- na.omit(data$NBA_FG3_PCT)
+x_scaled <- scale(x)
+d <- dist(x_scaled)
+hc <- hclust(d, method = "ward.D2")
+plot(hc, labels = FALSE, hang = -1,
+     main = "Hierarchical Clustering Dendrogram (NBA_FG3_PCT)")
+sil_width <- numeric(20)
+
+for (k in 3:6) {
+  clusters <- cutree(hc, k)
+  ss <- silhouette(clusters, d)
+  sil_width[k] <- mean(ss[, 3])
+}
+
+plot(3:6, sil_width[3:6], type = "b", pch = 19,
+     xlab = "Number of clusters k",
+     ylab = "Average silhouette width",
+     main = "Silhouette Method (NBA_FG3_PCT)")
+```
+
+```{r}
+best_k <- which.max(sil_width)
+clusters_best <- cutree(hc, k = best_k)
+
+plot(x, rep(0, length(x)), col = clusters_best, pch = 19,
+     xlab = "NBA_3PAPG", ylab = "",
+     yaxt = "n", main = paste("Hierarchical Clustering on NBA_FG3_PCTV (k =", best_k, ")"))
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+head(data)
+```
+```{r}
+class_levels <- c("BAD", "POOR", "AVERAGE", "GOOD", "GREAT")
+class_values <- setNames(1:5, class_levels)
+
+data <- data %>%
+  mutate(
+    VOL_VALUE = dplyr::recode(NBA_3PM_CLASS, !!!class_values),
+    EFF_VALUE = dplyr::recode(NBA_FG3_PCT_CLASS, !!!class_values),
+    CLASS_DIFF = abs(VOL_VALUE - EFF_VALUE),
+    NBA_3SHOOTING_CLASS = case_when(
+      is.na(NBA_3PM_CLASS) & is.na(NBA_FG3_PCT_CLASS) ~ NA_character_,
+      is.na(NBA_3PM_CLASS) ~ NBA_FG3_PCT_CLASS,
+      is.na(NBA_FG3_PCT_CLASS) ~ NBA_3PM_CLASS,
+      CLASS_DIFF <= 1 ~ if_else(VOL_VALUE > EFF_VALUE, NBA_3PM_CLASS, NBA_FG3_PCT_CLASS),
+      TRUE ~ if_else(VOL_VALUE < EFF_VALUE, NBA_3PM_CLASS, NBA_FG3_PCT_CLASS)
+    )
+  ) %>%
+  dplyr::select(-VOL_VALUE, -EFF_VALUE, -CLASS_DIFF)
+
+print("Combined shooting class distribution:")
+print(table(data$NBA_3SHOOTING_CLASS, useNA = "always"))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+X <- data[, 38:66]
+X[is.na(X)] <- 0
+class_levels <- c("BAD", "POOR", "AVERAGE", "GOOD", "GREAT")
+y <- factor(data[, ncol(data)])
+y <- factor(y, levels = class_levels)
+
+# We need to first reduce the amount of variables and remove colinear variables
+df <- data.frame(X, response = y)
+df_scaled <- data.frame(scale(df[, -ncol(df)]), response = df$response)
+
+full_model <- polr(response ~ ., data = df_scaled, Hess = TRUE)
+step_model <- suppressMessages(step(full_model, direction = "backward", k = log(1479)))
+
+```
+```{r}
+step_model <- polr(response ~ PRE_FG + PRE_FGA + PRE_FG_PCT + PRE_3PA + PRE_3P_PCT + 
+    PRE_FT + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, data = df_scaled, Hess = TRUE)
+summary(step_model)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+X <- data[, 38:66]
+X[is.na(X)] <- 0
+class_levels <- c("BAD", "POOR", "AVERAGE", "GOOD", "GREAT")
+y <- factor(data[, ncol(data)])
+y <- factor(y, levels = class_levels)
+
+# We need to first reduce the amount of variables and remove colinear variables
+df <- data.frame(X, response = y)
+df_scaled <- data.frame(scale(df[, -ncol(df)]), response = df$response)
+
+full_model <- orm(response ~ ., data = df_scaled)
+(step_model <- fastbw(fit = full_model, rule="p", type="individual", sls=0.001))
+```
+
+
+
+
+# LASSO Selection that didn't work (?) based on old stuff
+```{r}
+X <- data[, 38:66]
+X[is.na(X)] <- 0
+class_levels <- c("BAD", "POOR", "AVERAGE", "GOOD", "GREAT")
+y <- factor(data[, ncol(data)])
+y <- factor(y, levels = class_levels)
+
+X_matrix <- as.matrix(X)
+
+lasso_model <- cv.glmnet(X_matrix, y, 
+                        family = "multinomial", 
+                        alpha = 1,
+                        type.measure = "class", 
+                        nfolds = 15,
+                        nlambda = 50)
+
+optimal_lambda <- lasso_model$lambda.min
+print(paste("Optimal lambda:", optimal_lambda))
+
+final_lasso <- glmnet(X_matrix, y, 
+                     family = "multinomial", 
+                     alpha = 1, 
+                     lambda = optimal_lambda)
+coef(final_lasso) #they did not end up selecting strictly enough
+```
+
+
+```{r}
+vif(step_model)
+```
+```{r}
+predictors <- df_scaled[, c("PRE_FG", "PRE_FGA", "PRE_FG_PCT", "PRE_3PA", 
+    "PRE_3P_PCT", "PRE_FT", "PRE_FT_PCT", "PRE_BLK", "PRE_FG_pct_inc",
+    "PRE_3P_pct_inc")]
+cor_matrix <- cor(predictors)
+print(round(cor_matrix, 3))
+```
+Our main issue is between fga and fg, so we need to drop one of the two. 
+```{r}
+nofg <- polr(response ~ PRE_FGA + PRE_FG_PCT + PRE_3PA + PRE_3P_PCT + 
+    PRE_FT + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, data = df_scaled, Hess = TRUE)
+nofga <- polr(response ~ PRE_FG + PRE_FG_PCT + PRE_3PA + PRE_3P_PCT + 
+    PRE_FT + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, data = df_scaled, Hess = TRUE)
+
+AIC(nofg);AIC(nofga)
+```
+Because the no FG model has the lower AIC, it is the better model.
+```{r}
+summary(nofg)
+vif(nofg)
+predictors <- df_scaled[, c("PRE_FG", "PRE_FG_PCT", "PRE_3PA", 
+    "PRE_3P_PCT", "PRE_FT", "PRE_FT_PCT", "PRE_BLK", "PRE_FG_pct_inc",
+    "PRE_3P_pct_inc")]
+cor_matrix <- cor(predictors)
+print(round(cor_matrix, 3))
+```
+```{r}
+nofg <- polr(response ~ PRE_FG_PCT + PRE_3PA + PRE_3P_PCT + 
+    PRE_FT + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, data = df_scaled, Hess = TRUE)
+noft <- polr(response ~ PRE_FG + PRE_FG_PCT + PRE_3PA + PRE_3P_PCT 
+     + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, data = df_scaled, Hess = TRUE)
+
+AIC(nofg);AIC(noft)
+```
+```{r}
+summary(nofg)
+vif(nofg)
+predictors <- df_scaled[, c("PRE_FG", "PRE_FG_PCT", "PRE_3PA", 
+    "PRE_3P_PCT", "PRE_FT_PCT", "PRE_BLK", "PRE_FG_pct_inc",
+    "PRE_3P_pct_inc")]
+cor_matrix <- cor(predictors)
+print(round(cor_matrix, 3))
+```
+
+```{r}
+X <- data[, 38:66]
+X[is.na(X)] <- 0
+class_levels <- c("BAD", "POOR", "AVERAGE", "GOOD", "GREAT")
+y <- factor(data[, ncol(data)])
+y <- factor(y, levels = class_levels)
+
+df <- data.frame(X, response = y)
+df_scaled <- data.frame(scale(df[, -ncol(df)]), response = df$response)
+
+set.seed(22222)
+folds <- createFolds(df$response, k = 5)
+
+all_pred <- character(nrow(df_scaled))
+all_actual <- as.character(df_scaled$response)
+all_probs <- matrix(0, nrow = nrow(df_scaled), ncol = length(class_levels))
+colnames(all_probs) <- class_levels
+
+for(i in 1:5) {
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(1:nrow(df_scaled), test_idx)
+  
+  lda_fit <- lda(response ~ PRE_FG_PCT + PRE_3PA + PRE_3P_PCT + 
+    PRE_FT + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, 
+                 data = df_scaled[train_idx, ])
+  
+  pred_obj <- predict(lda_fit, df_scaled[test_idx, ])
+  all_pred[test_idx] <- as.character(pred_obj$class)
+  all_probs[test_idx, ] <- pred_obj$posterior
+}
+
+conf_matrix <- table(Predicted = all_pred, Actual = all_actual)
+LDA_acc <- sum(diag(conf_matrix)) / nrow(data)
+
+all_actual <- factor(all_actual, levels = class_levels)
+all_pred <- factor(all_pred, levels = class_levels)
+
+overall_multiclass <- multiclass.roc(all_actual, all_probs)
+cat("Overall multiclass AUC for LDA:", overall_multiclass$auc, "\n")
+
+fpr_grid <- seq(0, 1, length.out = 200)
+tpr_matrix <- matrix(NA, nrow = length(fpr_grid), ncol = length(class_levels))
+
+for (i in seq_along(class_levels)) {
+  class <- class_levels[i]
+  binary_actual <- factor(ifelse(all_actual == class, class, "Other"),
+                          levels = c("Other", class))
+  class_probs <- all_probs[, class]
+  
+  roc_obj <- roc(response = binary_actual,
+                 predictor = class_probs,
+                 levels = c("Other", class),
+                 positive = class,
+                 quiet = TRUE)
+  cat("AUC of", class, ":", auc(roc_obj), "\n")
+  
+  fpr <- 1 - roc_obj$specificities
+  tpr <- roc_obj$sensitivities
+
+  interp_tpr <- approx(fpr, tpr, xout = fpr_grid, ties = mean, rule = 2)$y
+  tpr_matrix[, i] <- interp_tpr
+}
+
+macro_tpr_lda <- rowMeans(tpr_matrix, na.rm = TRUE)
+macro_auc_lda <- auc(fpr_grid, macro_tpr_lda)
+
+confusionMatrix(data = all_pred, reference = all_actual, mode = "prec_recall")
+```
+
+```{r}
+X <- data[, 38:66]
+X[is.na(X)] <- 0
+class_levels <- c("BAD", "POOR", "AVERAGE", "GOOD", "GREAT")
+y <- factor(data[, ncol(data)])
+y <- factor(y, levels = class_levels)
+
+df <- data.frame(X, response = y)
+df_scaled <- data.frame(scale(df[, -ncol(df)]), response = df$response)
+
+set.seed(22222)
+folds <- createFolds(df_scaled$response, k = 5)
+
+all_pred <- character(nrow(df_scaled))
+all_actual <- as.character(df_scaled$response)
+all_probs <- matrix(0, nrow = nrow(df_scaled), ncol = length(class_levels))
+colnames(all_probs) <- class_levels
+
+for(i in 1:5) {
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(1:nrow(df_scaled), test_idx)
+  
+  qda_fit <-qda(response ~ PRE_FG_PCT + PRE_3PA + PRE_3P_PCT + 
+    PRE_FT + PRE_FT_PCT + PRE_BLK + PRE_FG_pct_inc + PRE_3P_pct_inc, 
+                 data = df_scaled[train_idx, ])
+  
+  pred_obj <- predict(qda_fit, df_scaled[test_idx, ])
+  all_pred[test_idx] <- as.character(pred_obj$class)
+  all_probs[test_idx, ] <- pred_obj$posterior
+}
+
+conf_matrix <- table(Predicted = all_pred, Actual = all_actual)
+QDA_acc <- sum(diag(conf_matrix)) / nrow(data)
+
+all_actual <- factor(all_actual, levels = class_levels)
+all_pred <- factor(all_pred, levels = class_levels)
+
+overall_multiclass <- multiclass.roc(all_actual, all_probs)
+cat("Overall multiclass AUC for QDA:", overall_multiclass$auc, "\n")
+
+fpr_grid <- seq(0, 1, length.out = 200)
+tpr_matrix <- matrix(NA, nrow = length(fpr_grid), ncol = length(class_levels))
+
+for (i in seq_along(class_levels)) {
+  class <- class_levels[i]
+  binary_actual <- factor(ifelse(all_actual == class, class, "Other"),
+                          levels = c("Other", class))
+  class_probs <- all_probs[, class]
+  
+  roc_obj <- roc(response = binary_actual,
+                 predictor = class_probs,
+                 levels = c("Other", class),
+                 positive = class,
+                 quiet = TRUE)
+  cat("AUC of", class, ":", auc(roc_obj), "\n")
+  
+  fpr <- 1 - roc_obj$specificities
+  tpr <- roc_obj$sensitivities
+
+  interp_tpr <- approx(fpr, tpr, xout = fpr_grid, ties = mean, rule = 2)$y
+  tpr_matrix[, i] <- interp_tpr
+}
+
+macro_tpr_qda <- rowMeans(tpr_matrix, na.rm = TRUE)
+macro_auc_qda <- auc(fpr_grid, macro_tpr_qda)
+
+confusionMatrix(data = all_pred, reference = all_actual, mode = "prec_recall")
+```
+
+
+```{r}
+LDA_acc - QDA_acc
+```
+```{r}
+plot(fpr_grid, macro_tpr_lda, type = "l", lwd = 2, col = "black",
+     xlab = "1 - Specificity (FPR)", ylab = "Sensitivity (TPR)",
+     main = paste("Macro-average ROC Curves of LDA and QDA"))
+abline(a = 0, b = 1, lty = 2, col = "gray")
+lines(fpr_grid, macro_tpr_qda, lwd = 2, col = "red")
+legend("bottomright",
+       legend = c(paste("LDA (AUC =", round(macro_auc_lda, 3), ")"),
+                  paste("QDA (AUC =", round(macro_auc_qda, 3), ")")),
+       col = c("black", "red"), lwd = 2)
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+pca_result <- prcomp(df_scaled[, -ncol(df_scaled)], center = TRUE, scale. = TRUE)
+explained_var <- summary(pca_result)$importance[3, ]
+num_pcs <- which(cumsum(summary(pca_result)$importance[2, ]) >= 0.9)[1]
+
+df_pca <- data.frame(pca_result$x[, 1:num_pcs], response = df_scaled$response)
+dd <- datadist(df_pca)
+options(datadist = "dd")
+
+pca_model <- orm(response ~ ., data = df_pca)
+summary(pca_model)
+```
+```{r}
+ggplot(df_pca, aes(x = PC1, y = PC2, color = response)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "Class Separation in PCA Space",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal()
+
+loadings <- pca_result$rotation[, 1:num_pcs]
+print("PCA Loadings (contribution of original variables):")
+print(loadings)
+
+cat("AIC PCA model:", AIC(pca_model), "\n")
+cat("AIC Stepwise model:", AIC(full_model), "\n") 
+```
+
+```{r}
+pca_result <- prcomp(df_scaled[, -ncol(df_scaled)], center = TRUE, scale. = TRUE)
+explained_var <- summary(pca_result)$importance[2, ]
+num_pcs <- which(cumsum(explained_var) >= 0.9)[1]
+
+df_pca <- data.frame(pca_result$x[, 1:num_pcs], response = df_scaled$response)
+
+set.seed(23)
+train_control <- trainControl(method = "cv", number = 10)
+
+model_pca <- train(response ~ ., data = df_pca,
+                   method = "multinom",
+                   trControl = train_control,
+                   trace = FALSE)
+
+cat("Cross-validated accuracy (PCA-based model):",max(model_pca$results$Accuracy), "\n")
+preds_pca <- predict(model_pca, newdata = df_pca)
+preds_pca <- factor(preds_pca, levels = levels(df_pca$response))
+
+cm_pca <- confusionMatrix(preds_pca, df_pca$response, mode = "prec_recall")
+print(cm_pca)
+```
+
+

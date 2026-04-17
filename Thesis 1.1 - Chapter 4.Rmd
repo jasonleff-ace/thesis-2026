@@ -1,0 +1,194 @@
+---
+title: "Thesis"
+author: "Jason Leff"
+date: "2025-09-19"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(MASS)
+library(plotly)
+```
+
+```{r}
+rm(list=ls())
+data <- read.csv('data_with_pre_data.csv')
+set.seed(67)
+```
+```{r}
+head(data)
+```
+
+# Normalize to Per Minute Data
+```{r}
+normalize_stats <- function(df) {
+  nba_start <- which(names(df) == "NBA_MIN") #split the data
+  nba_end   <- which(names(df) == "PRE_G")
+  
+  for (i in (nba_start+1):(nba_end-1)) {
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) { #divide total columns by minute column
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["NBA_MIN"]]),3)
+    }
+  }
+  pre_start <- which(names(df) == "PRE_MP")
+  for (i in (pre_start+1):ncol(df)) { #repeat for college
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) {
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["PRE_MP"]]),3)
+    }
+  }
+  return(df)
+}
+per_min_data <- normalize_stats(data)
+```
+
+# Simple Linear Model Predicting 3 Point Percentage from Pre-NBA Free Throw Percentage
+```{r}
+FTto3 <- lm(NBA_FG3_PCT ~ PRE_FT_PCT, data = data)
+summary(FTto3)
+```
+```{r}
+FTto3 <- lm(NBA_FG3_PCT ~ 0 + PRE_FT_PCT, data = data)
+summary(FTto3)
+```
+
+```{r}
+ggplot(data, aes(x = PRE_FT_PCT, y = NBA_FG3_PCT)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "Pre-NBA Free Throw %", y = "NBA 3-Point %", title = "Pre-NBA Free Throw % vs NBA 3-Point % (Min. 25 Attempts Each)", subtitle = paste("n =", nrow(data), "players")) +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+```{r}
+data_filtered <- data %>%
+  filter(PRE_FTA > 25 & NBA_FG3A > 25)
+
+data_filtered <- normalize_stats(data_filtered)
+
+FTto3 <- lm(NBA_FG3_PCT ~ PRE_FT_PCT, data = data_filtered)
+summary(FTto3)
+
+ggplot(data_filtered, aes(x = PRE_FT_PCT, y = NBA_FG3_PCT)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.2) +
+  labs(
+    x = "Pre-NBA Free Throw Percentage", 
+    y = "NBA 3-Point Percentage",
+    title = "Pre-NBA Free Throw % vs NBA 3-Point % (Min. 25 Attempts Each)",
+    subtitle = paste("n =", nrow(data_filtered), "players")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+# Simple Linear Model Predicting 3 Point Percentage from Pre-NBA 3 Point Percentage
+```{r}
+Pre3toNBA3 <- lm(NBA_FG3_PCT ~ PRE_3P_PCT, data = data)
+summary(Pre3toNBA3)
+```
+
+```{r}
+ggplot(data_filtered, aes(x = PRE_3P_PCT, y = NBA_FG3_PCT, color = PRE_COL_or_INT)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", alpha = 0.05) +
+  labs(
+    x = "Pre-NBA Three Point Percentage", 
+    y = "NBA 3-Point Percentage",
+    title = "Pre-NBA 3-Point % vs NBA 3-Point % (Min. 25 Attempts Each)",
+    subtitle = paste("n =", nrow(data_filtered), "players")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+# MLR of both PRE-NBA FT% and 3P% vs NBA 3P%
+```{r}
+FT3P_to_NBA3 <- lm(NBA_FG3_PCT ~ PRE_3P_PCT+PRE_FT_PCT, data=data)
+summary(FT3P_to_NBA3)
+```
+```{r}
+clean_data <- na.omit(data[c("NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+colors <- rainbow(length(levels(color_factor)))[color_factor]
+s3d <- scatterplot3d(clean_data$PRE_3P_PCT, clean_data$PRE_FT_PCT, clean_data$NBA_FG3_PCT,
+                     color = colors, pch = 16,
+                     xlab = "Pre-3P%", ylab = "Pre-FT%", zlab = "NBA-3P%",
+                     main = "Pre-3P% and Pre-FT% vs. NBA-3P% Unfiltered")
+s3d$plane3d(model, lty.box = "solid")
+
+legend("topright", legend = levels(color_factor), 
+       col = rainbow(length(levels(color_factor))), pch = 16)
+```
+# MLR of both PRE-NBA FT% and 3P% vs NBA 3P% filtered for 25 attempts
+```{r}
+data_filtered2 <- data %>%
+  filter(PRE_3PA >= 25 & PRE_FTA >= 25 & NBA_FG3A >= 25)
+
+data_filtered2 <- normalize_stats(data_filtered2)
+
+clean_data <- na.omit(data_filtered2[c("PLAYER","NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+summary(model)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+colors <- rainbow(length(levels(color_factor)))[color_factor]
+s3d <- scatterplot3d(clean_data$PRE_3P_PCT, clean_data$PRE_FT_PCT, clean_data$NBA_FG3_PCT,
+                     color = colors, pch = 16,
+                     xlab = "Pre-3P%, >= 25 Attempts", ylab = "Pre-FT%, >= 25 Attempts", zlab = "NBA-3P%, >= 25 Attempts",
+                     main = "Pre-3P% and Pre-FT% vs. NBA-3P% Filtered for 25+ Attempts")
+s3d$plane3d(model, lty.box = "solid")
+
+legend("topright", legend = levels(color_factor), 
+       col = rainbow(length(levels(color_factor))), pch = 16)
+```
+
+```{r}
+FTto3 <- lm(NBA_FG3M ~ PRE_FT_PCT, data = data_filtered)
+summary(FTto3)
+
+ggplot(data_filtered, aes(x = PRE_FT_PCT, y = NBA_FG3M)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.2) +
+  labs(
+    x = "Pre-NBA Free Throw Percentage", 
+    y = "NBA 3-Point Made Per Game",
+    title = "Pre-NBA Free Throw % vs NBA 3-Point Made Per Minute (Min. 25 Attempts Each)",
+    subtitle = paste("n =", nrow(data_filtered), "players")
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))+
+  coord_cartesian(ylim = c(0,NA))
+```
+
+```{r}
+year_data <- read.csv('THESIScharts.csv')
+year_data$Avg.3PA.per.team <- year_data$Avg.3PA.per.team*2
+
+ggplot(year_data, aes(x = Year, y = Avg.3PA.per.team, group = 1)) +
+  geom_line(color = "#2C73D2", size = 1.4) +
+  geom_point(color = "#2C73D2", size = 3) +
+  labs(
+    title = "NBA Average 3-Point Attempts per Game by Season",
+    x = "Season",
+    y = "Avg 3PA per Game"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(,
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+

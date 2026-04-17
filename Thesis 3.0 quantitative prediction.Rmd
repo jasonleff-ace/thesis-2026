@@ -1,0 +1,984 @@
+---
+title: "Thesis"
+author: "Jason Leff"
+date: "2026-01-10"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(scatterplot3d)
+library(MASS)
+library(caret)
+library(glmnet)
+library(car)
+library(MLmetrics)
+library(nnet)
+library(pROC)
+library(multiROC)
+library(cluster)
+library(rms)
+library(leaps)
+library(e1071)
+library(randomForest)
+library(xgboost)
+library(factoextra)
+library(nnet)
+library(glmnetcr)
+library(ordinalNet)
+library(pracma)
+library(plotly)
+```
+
+# Setup
+```{r}
+rm(list=ls())
+data <- read.csv('data_with_pre_data.csv')
+set.seed(67)
+```
+# Initializing Functions
+```{r}
+heatmap <- function(ConfMatrix, color, title) { #Unused heatmap function
+  cm_table <- as.data.frame(ConfMatrix$table)
+ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 4) +
+  scale_fill_gradient(low = "white", high = color) +
+  theme_minimal() +
+  labs(title = paste0("Confusion Matrix Heatmap (", title, ")"),
+       x = "Actual Class", y = "Predicted Class")
+}
+```
+
+```{r}
+within_one_class_pct <- function(ConfusionMatrix) { #Unused ordinal statistic calculator
+  classes <- rownames(ConfusionMatrix)
+  n_class <- length(classes)
+  idx <- seq_len(n_class)
+  total <- sum(ConfusionMatrix)
+  count_valid <- 0
+  for (i in idx) {
+    valid_pred <- i
+    if (i == 1) {valid_pred <- c(valid_pred, 2)} 
+    else if (i == n_class) {valid_pred <- c(valid_pred, n_class - 1)} 
+    else {valid_pred <- c(valid_pred, i - 1, i + 1)}
+    count_valid <- count_valid + sum(ConfusionMatrix[i, valid_pred])
+  }
+  count_valid / total
+}
+```
+
+```{r}
+macro_auc <- function(y_true, prob_matrix) { #Used to calculate AUC for each model
+  classes <- levels(y_true)
+  aucs <- numeric(length(classes))
+  for (i in seq_along(classes)) {
+    cls <- classes[i]
+    y_binary <- as.numeric(y_true == cls)
+    p <- prob_matrix[, cls]
+
+    roc_obj <- try(roc(y_binary, p, quiet = TRUE), silent = TRUE)
+
+    if (inherits(roc_obj, "try-error") || is.null(roc_obj$auc)) {
+      aucs[i] <- NA_real_
+    } else {
+      aucs[i] <- as.numeric(roc_obj$auc)
+    }
+  }
+  mean(aucs, na.rm = TRUE)
+}
+```
+
+# Normalize to Per Minute Data
+```{r}
+normalize_stats <- function(df) {
+  nba_start <- which(names(df) == "NBA_MIN") #split the data
+  nba_end   <- which(names(df) == "PRE_G")
+  
+  for (i in (nba_start+1):(nba_end-1)) {
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) { #divide total columns by minute column
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["NBA_MIN"]]),3)
+    }
+  }
+  pre_start <- which(names(df) == "PRE_MP")
+  for (i in (pre_start+1):ncol(df)) { #repeat for college
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) {
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["PRE_MP"]]),3)
+    }
+  }
+  return(df)
+}
+per_min_data <- normalize_stats(data)
+```
+
+# PRE-NBA FT% and 3P% vs NBA 3P% filtered for 25 attempts
+```{r}
+data_filtered2 <- data %>%
+  filter(PRE_3PA >= 25 & PRE_FTA >= 25 & NBA_FG3A >= 25)
+
+clean_data <- na.omit(data_filtered2[c("PLAYER","NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+summary(model)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+colors <- rainbow(length(levels(color_factor)))[color_factor]
+s3d <- scatterplot3d(clean_data$PRE_3P_PCT, clean_data$PRE_FT_PCT, clean_data$NBA_FG3_PCT,
+                     color = colors, pch = 16,
+                     xlab = "Pre-3P%, >= 25 Attempts", ylab = "Pre-FT%, >= 25 Attempts", zlab = "NBA 3P%, >= 25 Attempts",
+                     main = "Colored by PRE_COL_OR_INT")
+s3d$plane3d(model, lty.box = "solid")
+
+legend("topright", legend = levels(color_factor), 
+       col = rainbow(length(levels(color_factor))), pch = 16)
+```
+
+
+# Initialize Train / Test Split
+```{r}
+per_min_data2 <- filter(per_min_data, NBA_MIN >= 250) # Filter out players with less than 250 min played
+# Specific set of predictors
+X <- per_min_data2[, c(8,13,38:40,42,43,45,46,48:50, 52:55, 56:66)]
+X[is.na(X)] <- 0
+y <- per_min_data2[,20] # per_min_data[,21 or 22] for 3PAPM or 3PCT
+
+df <- data.frame(X, response = y)
+df_scaled <- data.frame(scale(df[, -ncol(df)]), response = df$response)
+
+# Split train and test
+set.seed(67)
+train_index <- createDataPartition(df_scaled$response, p = 0.8, list = FALSE)
+train_data <- df_scaled[train_index, ]
+test_data  <- df_scaled[-train_index, ]
+
+x_train <- as.matrix(train_data[, -ncol(train_data)])
+y_train <- train_data$response
+x_test <- as.matrix(test_data[, -ncol(test_data)])
+y_test <- test_data$response
+```
+
+# Initializing Storing Results
+```{r}
+model_results <- data.frame(
+  Model = character(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+model_results_cv <- data.frame(
+  Model = character(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+```
+
+# Function for calculating accuracy metrics
+```{r}
+calculate_metrics <- function(predictions, actual) {
+  rmse_val <- sqrt(mean((predictions - actual)^2))
+  mae_val <- mean(abs(predictions - actual))
+  r2_val <- 1 - sum((actual - predictions)^2) / sum((actual - mean(actual))^2)
+  return(c(rmse_val, mae_val, r2_val))
+}
+```
+
+# Linear Regression
+```{r}
+lm_model <- lm(response ~ ., data = train_data)
+lm_pred <- predict(lm_model, newdata = test_data)
+lm_metrics <- calculate_metrics(lm_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Linear Regression (OLS)",
+  RMSE = lm_metrics[1],
+  MAE = lm_metrics[2],
+  R2 = lm_metrics[3]
+))
+```
+
+
+# Ridge Regression
+```{r}
+set.seed(67)
+ridge_cv <- cv.glmnet(x_train, y_train, alpha = 0, nfolds = 10)
+ridge_best_lambda <- ridge_cv$lambda.min
+ridge_model <- glmnet(x_train, y_train, alpha = 0, lambda = ridge_best_lambda)
+ridge_pred <- predict(ridge_model, newx = x_test)
+ridge_metrics <- calculate_metrics(ridge_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Ridge Regression",
+  RMSE = ridge_metrics[1],
+  MAE = ridge_metrics[2],
+  R2 = ridge_metrics[3]
+))
+
+```
+
+
+# LASSO Regression
+```{r}
+set.seed(67)
+lasso_cv <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 10)
+lasso_best_lambda <- lasso_cv$lambda.min
+lasso_model <- glmnet(x_train, y_train, alpha = 1, lambda = lasso_best_lambda)
+lasso_pred <- predict(lasso_model, newx = x_test)
+lasso_metrics <- calculate_metrics(lasso_pred, y_test)
+
+# Get non-zero coefficients from Lasso
+lasso_coef <- coef(lasso_model)
+non_zero_vars <- rownames(lasso_coef)[which(lasso_coef != 0)][-1] # Remove intercept
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Lasso Regression",
+  RMSE = lasso_metrics[1],
+  MAE = lasso_metrics[2],
+  R2 = lasso_metrics[3]
+))
+
+```
+
+
+# Best Subset Selection
+```{r}
+set.seed(67)
+folds <- createFolds(train_data$response, k = 10)
+n_predictors <- ncol(x_train)
+
+if(n_predictors <= 30) {
+  # Need to do subset selection within each fold
+  subset_cv_rmse <- numeric(10)
+  subset_cv_mae <- numeric(10)
+  subset_cv_r2 <- numeric(10)
+  
+  for(i in 1:10) {
+    train_fold <- train_data[-folds[[i]], ]
+    valid_fold <- train_data[folds[[i]], ]
+    
+    # Perform subset selection on training fold
+    subset_fold <- regsubsets(response ~ ., data = train_fold, 
+                              nvmax = min(15, n_predictors),
+                              really.big = TRUE)
+    
+    subset_summary_fold <- summary(subset_fold)
+    best_size_fold <- which.min(subset_summary_fold$bic)
+    coef_best_fold <- coef(subset_fold, id = best_size_fold)
+    selected_vars_fold <- names(coef_best_fold)[-1]
+    
+    if(length(selected_vars_fold) > 0) {
+      fold_formula <- as.formula(paste("response ~", 
+                                       paste(selected_vars_fold, collapse = " + ")))
+      best_lm_fold <- lm(fold_formula, data = train_fold)
+      fold_pred <- predict(best_lm_fold, newdata = valid_fold)
+    } else {
+      fold_pred <- rep(mean(train_fold$response), nrow(valid_fold))
+    }
+    
+    fold_actual <- valid_fold$response
+    subset_cv_rmse[i] <- sqrt(mean((fold_pred - fold_actual)^2))
+    subset_cv_mae[i] <- mean(abs(fold_pred - fold_actual))
+    subset_cv_r2[i] <- 1 - sum((fold_actual - fold_pred)^2) / sum((fold_actual - mean(fold_actual))^2)
+  }
+  
+  model_results_cv <- rbind(model_results_cv, data.frame(
+    Model = "Best Subset Selection (10-fold CV)",
+    RMSE = mean(subset_cv_rmse),
+    MAE = mean(subset_cv_mae),
+    R2 = mean(subset_cv_r2)
+  ))
+}
+```
+
+
+# Forward Stepwise Selection
+```{r}
+set.seed(67)
+folds <- createFolds(train_data$response, k = 10)
+
+forward_cv_rmse <- numeric(10)
+forward_cv_mae <- numeric(10)
+forward_cv_r2 <- numeric(10)
+
+for(i in 1:10) {
+  train_fold <- train_data[-folds[[i]], ]
+  valid_fold <- train_data[folds[[i]], ]
+  
+  # Perform forward selection on training fold
+  null_fold <- lm(response ~ 1, data = train_fold)
+  full_fold <- lm(response ~ ., data = train_fold)
+  forward_fold <- step(null_fold, 
+                       scope = list(lower = null_fold, upper = full_fold),
+                       direction = "forward", trace = 0)
+  
+  fold_pred <- predict(forward_fold, newdata = valid_fold)
+  fold_actual <- valid_fold$response
+  
+  forward_cv_rmse[i] <- sqrt(mean((fold_pred - fold_actual)^2))
+  forward_cv_mae[i] <- mean(abs(fold_pred - fold_actual))
+  forward_cv_r2[i] <- 1 - sum((fold_actual - fold_pred)^2) / sum((fold_actual - mean(fold_actual))^2)
+}
+
+model_results_cv <- rbind(model_results_cv, data.frame(
+  Model = "Forward Stepwise (10-fold CV)",
+  RMSE = mean(forward_cv_rmse),
+  MAE = mean(forward_cv_mae),
+  R2 = mean(forward_cv_r2)
+))
+```
+
+
+# Weighted Regression based on minutes
+```{r}
+weights_vec <- per_min_data2$NBA_MIN[train_index]
+weighted_lm <- lm(response ~ ., data = train_data, weights = weights_vec)
+weighted_pred <- predict(weighted_lm, newdata = test_data)
+weighted_metrics <- calculate_metrics(weighted_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Weighted OLS (by NBA_MIN)",
+  RMSE = weighted_metrics[1],
+  MAE = weighted_metrics[2],
+  R2 = weighted_metrics[3]
+))
+```
+
+
+# Elastic Net
+```{r}
+set.seed(67)
+# Try alpha = 0.5 (equal mix)
+enet_cv <- cv.glmnet(x_train, y_train, alpha = 0.5, nfolds = 10)
+enet_best_lambda <- enet_cv$lambda.min
+enet_model <- glmnet(x_train, y_train, alpha = 0.5, lambda = enet_best_lambda)
+enet_pred <- predict(enet_model, newx = x_test)
+enet_metrics <- calculate_metrics(enet_pred, y_test)
+
+model_results <- rbind(model_results, data.frame(
+  Model = "Elastic Net (alpha=0.5)",
+  RMSE = enet_metrics[1],
+  MAE = enet_metrics[2],
+  R2 = enet_metrics[3]
+))
+```
+
+```{r}
+# Print results
+cat("\n=== MODEL COMPARISON ===\n")
+print(model_results)
+
+# Sort by RMSE (lower is better)
+cat("\n=== SORTED BY RMSE (Best to Worst) ===\n")
+print(model_results[order(model_results$RMSE), ])
+
+# Variable importance from Lasso
+cat("\n=== LASSO SELECTED VARIABLES ===")
+if(length(non_zero_vars) > 0) {
+  cat("\nNumber of variables selected:", length(non_zero_vars), "\n")
+  cat("Selected variables:\n")
+  print(non_zero_vars)
+} else {
+  cat("\nLasso selected no variables (all coefficients shrunk to zero)\n")
+}
+
+# Compare with OLS coefficients
+cat("\n=== OLS vs LASSO COEFFICIENT MAGNITUDES ===")
+ols_coef <- coef(lm_model)
+lasso_coef_vec <- as.numeric(lasso_coef)
+names(lasso_coef_vec) <- rownames(lasso_coef)
+
+# Create comparison dataframe
+coef_comparison <- data.frame(
+  Variable = names(ols_coef),
+  OLS_Coefficient = round(ols_coef, 4),
+  Lasso_Coefficient = round(lasso_coef_vec[match(names(ols_coef), names(lasso_coef_vec))], 4)
+)
+coef_comparison$Shrinkage <- round(abs(coef_comparison$Lasso_Coefficient) / 
+                                   abs(coef_comparison$OLS_Coefficient), 3)
+coef_comparison$Shrinkage[is.na(coef_comparison$Shrinkage)] <- 0
+coef_comparison$Shrinkage[is.infinite(coef_comparison$Shrinkage)] <- NA
+
+cat("\nTop 10 variables by absolute OLS coefficient:\n")
+print(head(coef_comparison[order(-abs(coef_comparison$OLS_Coefficient)), ], 10))
+```
+# OLS with CV
+```{r}
+set.seed(67)
+cv_folds <- createFolds(train_data$response, k = 10)
+cv_rmse_ols <- numeric(10)
+cv_mae_ols <- numeric(10)
+cv_r2_ols <- numeric(10)
+
+for(i in 1:10) {
+  train_fold <- train_data[-cv_folds[[i]], ]
+  valid_fold <- train_data[cv_folds[[i]], ]
+  
+  fold_model <- lm(response ~ ., data = train_fold)
+  fold_pred <- predict(fold_model, newdata = valid_fold)
+  
+  cv_rmse_ols[i] <- sqrt(mean((fold_pred - valid_fold$response)^2))
+  cv_mae_ols[i] <- mean(abs(fold_pred - valid_fold$response))
+  cv_r2_ols[i] <- 1 - sum((valid_fold$response - fold_pred)^2) / 
+    sum((valid_fold$response - mean(valid_fold$response))^2)
+}
+```
+
+# OLS polynmials with CV
+```{r}
+set.seed(67)
+cv_folds <- createFolds(train_data$response, k = 10)
+cv_rmse_poly_ols <- numeric(10)
+cv_mae_poly_ols <- numeric(10)
+cv_r2_poly_ols <- numeric(10)
+
+for(i in 1:10) {
+  train_fold <- train_data[-cv_folds[[i]], ]
+  valid_fold <- train_data[cv_folds[[i]], ]
+  
+  fold_model <- lm(response ~ ., data = train_fold)
+  fold_pred <- predict(fold_model, newdata = valid_fold)
+  
+  cv_rmse_poly_ols[i] <- sqrt(mean((fold_pred - valid_fold$response)^2))
+  cv_mae_poly_ols[i] <- mean(abs(fold_pred - valid_fold$response))
+  cv_r2_poly_ols[i] <- 1 - sum((valid_fold$response - fold_pred)^2) / 
+    sum((valid_fold$response - mean(valid_fold$response))^2)
+}
+```
+
+# WLS with CV
+```{r}
+cv_rmse_wls <- numeric(10)
+cv_mae_wls <- numeric(10)
+cv_r2_wls <- numeric(10)
+
+for(i in 1:10) {
+  train_fold <- train_data[-cv_folds[[i]], ]
+  valid_fold <- train_data[cv_folds[[i]], ]
+  fold_weights <- weights_vec[-cv_folds[[i]]]
+  
+  fold_model <- lm(response ~ ., data = train_fold, weights = fold_weights)
+  fold_pred <- predict(fold_model, newdata = valid_fold)
+  
+  cv_rmse_wls[i] <- sqrt(mean((fold_pred - valid_fold$response)^2))
+  cv_mae_wls[i] <- mean(abs(fold_pred - valid_fold$response))
+  cv_r2_wls[i] <- 1 - sum((valid_fold$response - fold_pred)^2) / 
+    sum((valid_fold$response - mean(valid_fold$response))^2)
+}
+```
+
+```{r}
+model_results_cv <- rbind(model_results_cv, 
+  data.frame(
+    Model = "Linear Regression (10-fold CV)",
+    RMSE = mean(cv_rmse_ols),
+    MAE = mean(cv_mae_ols),
+    R2 = mean(cv_r2_ols)
+  ),
+  data.frame(
+    Model = "Linear Regression with polynomial terms (10-fold CV)",
+    RMSE = mean(cv_rmse_poly_ols),
+    MAE = mean(cv_mae_poly_ols),
+    R2 = mean(cv_r2_poly_ols)
+  ),
+  data.frame(
+    Model = "Weighted OLS (10-fold CV)",
+    RMSE = mean(cv_rmse_wls),
+    MAE = mean(cv_mae_wls),
+    R2 = mean(cv_r2_wls)
+  )
+)
+
+cat("\n=== CV MODEL RESULTS ===\n")
+print(model_results_cv[order(model_results_cv$RMSE), ])
+```
+```{r}
+all_results <- rbind(model_results, model_results_cv)
+cat("\n=== ALL MODEL RESULTS ===\n")
+print(all_results[order(all_results$RMSE), ])
+```
+
+# Random Forest?
+
+# Model Results
+```{r}
+print(model_results)
+```
+
+# OLS results
+```{r}
+final_ols <- lm(response ~ ., data = train_data)
+par(mfrow = c(2, 2))
+plot(final_ols)
+par(mfrow = c(1, 1))
+library(ggplot2)
+
+ggplot(data.frame(
+  fitted = fitted(final_ols),
+  resid = resid(final_ols)
+), aes(x = fitted, y = resid)) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_hline(yintercept = 0, color = "red", linewidth = 1) +
+  labs(
+    title = "Fitted vs Residuals",
+    x = "Fitted Values",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+```{r}
+final_ols_model <- lm(response ~ ., data = train_data)
+test_pred <- predict(final_ols_model, newdata = test_data)
+
+# Create a dataframe for plotting
+plot_data <- data.frame(
+  Actual = y_test,
+  Predicted = test_pred,
+  Residual = y_test - test_pred,
+  Abs_Residual = abs(y_test - test_pred)
+)
+
+# Add player names if available
+if("PLAYER" %in% names(per_min_data2)) {
+  plot_data$Player <- per_min_data2$PLAYER[-train_index]
+} else {
+  plot_data$Player <- paste("Player", 1:nrow(plot_data))
+}
+
+# Add cluster info if available
+if("Cluster3Shooting_recordered" %in% names(per_min_data2)) {
+  plot_data$Cluster <- per_min_data2$Cluster3Shooting_recordered[-train_index]
+}
+
+# 1. Basic interactive scatter plot
+p1 <- plot_ly(plot_data, x = ~Actual, y = ~Predicted,
+              type = 'scatter', mode = 'markers',
+              marker = list(size = 10, opacity = 0.7),
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player,
+                           '<br>Actual: ', round(Actual, 4),
+                           '<br>Predicted: ', round(Predicted, 4),
+                           '<br>Residual: ', round(Residual, 4))) %>%
+  layout(title = 'Actual vs Predicted 3PA per Minute (Test Set)',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'),
+         shapes = list(list(
+           type = 'line',
+           x0 = min(plot_data$Actual), x1 = max(plot_data$Actual),
+           y0 = min(plot_data$Actual), y1 = max(plot_data$Actual),
+           line = list(color = 'red', width = 2, dash = 'solid')
+         )))
+```
+```{r}
+# 2. Color by residual magnitude
+p2 <- plot_ly(plot_data, x = ~Actual, y = ~Predicted,
+              color = ~Abs_Residual,
+              colors = NULL,
+              type = 'scatter', mode = 'markers',
+              marker = list(size = 10, opacity = 0.8),
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player,
+                           '<br>Actual: ', round(Actual, 4),
+                           '<br>Predicted: ', round(Predicted, 4),
+                           '<br>Error: ', round(Residual, 4))) %>%
+  layout(title = 'Actual vs Predicted (Colored by Error Magnitude)',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'),
+         shapes = list(list(
+           type = 'line',
+           x0 = min(plot_data$Actual), x1 = max(plot_data$Actual),
+           y0 = min(plot_data$Actual), y1 = max(plot_data$Actual),
+           line = list(color = 'red', width = 2)
+         )))
+
+# 3. With clustering if available
+if("Cluster" %in% names(plot_data)) {
+  p3 <- plot_ly(plot_data, x = ~Actual, y = ~Predicted,
+                color = ~Cluster,
+                colors = 'Set1',
+                type = 'scatter', mode = 'markers',
+                marker = list(size = 10, opacity = 0.7),
+                hoverinfo = 'text',
+                text = ~paste('Player: ', Player,
+                             '<br>Cluster: ', Cluster,
+                             '<br>Actual: ', round(Actual, 4),
+                             '<br>Predicted: ', round(Predicted, 4))) %>%
+    layout(title = 'Actual vs Predicted (Colored by Shooting Cluster)',
+           xaxis = list(title = 'Actual 3PAPM'),
+           yaxis = list(title = 'Predicted 3PAPM'),
+           shapes = list(list(
+             type = 'line',
+             x0 = min(plot_data$Actual), x1 = max(plot_data$Actual),
+             y0 = min(plot_data$Actual), y1 = max(plot_data$Actual),
+             line = list(color = 'black', width = 2, dash = 'dash')
+           )))
+} else {
+  # Create clusters based on actual values for visualization
+  plot_data$Performance_Group <- cut(plot_data$Actual, 
+                                     breaks = quantile(plot_data$Actual, 
+                                                      probs = seq(0, 1, 0.25)),
+                                     labels = c("Low", "Mid-Low", "Mid-High", "High"))
+  
+  p3 <- plot_ly(plot_data, x = ~Actual, y = ~Predicted,
+                color = ~Performance_Group,
+                colors = 'Set2',
+                type = 'scatter', mode = 'markers',
+                marker = list(size = 10, opacity = 0.7),
+                hoverinfo = 'text',
+                text = ~paste('Player: ', Player,
+                             '<br>Group: ', Performance_Group,
+                             '<br>Actual: ', round(Actual, 4),
+                             '<br>Predicted: ', round(Predicted, 4))) %>%
+    layout(title = 'Actual vs Predicted (Colored by Performance Quartile)',
+           xaxis = list(title = 'Actual 3PAPM'),
+           yaxis = list(title = 'Predicted 3PAPM'))
+}
+
+# 4. Residuals plot (interactive)
+p4 <- plot_ly(plot_data, x = ~Predicted, y = ~Residual,
+              type = 'scatter', mode = 'markers',
+              marker = list(size = 10, opacity = 0.7,
+                           color = ~Abs_Residual,
+                           colorscale = 'RdBu',
+                           showscale = TRUE,
+                           colorbar = list(title = "|Error|")),
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player,
+                           '<br>Predicted: ', round(Predicted, 4),
+                           '<br>Residual: ', round(Residual, 4))) %>%
+  add_lines(x = range(plot_data$Predicted), 
+            y = c(0, 0),
+            line = list(color = 'red', width = 2)) %>%
+  layout(title = 'Residuals vs Predicted Values',
+         xaxis = list(title = 'Predicted 3PAPM'),
+         yaxis = list(title = 'Residual (Actual - Predicted)'))
+
+# 5. 3D plot with residuals
+p5 <- plot_ly(plot_data, x = ~Actual, y = ~Predicted, z = ~Abs_Residual,
+              type = 'scatter3d', mode = 'markers',
+              marker = list(size = 5, opacity = 0.8,
+                           color = ~Abs_Residual,
+                           colorscale = 'blues'),
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player,
+                           '<br>Actual: ', round(Actual, 4),
+                           '<br>Predicted: ', round(Predicted, 4),
+                           '<br>|Error|: ', round(Abs_Residual, 4))) %>%
+  layout(title = '3D: Actual vs Predicted vs Error',
+         scene = list(
+           xaxis = list(title = 'Actual'),
+           yaxis = list(title = 'Predicted'),
+           zaxis = list(title = 'Absolute Error')
+         ))
+
+# 6. Add confidence intervals (simplified)
+# Calculate approximate prediction intervals
+pred_se <- sqrt(sum(plot_data$Residual^2) / (nrow(plot_data) - ncol(x_train) - 1))
+plot_data$Lower_95 <- plot_data$Predicted - 1.96 * pred_se
+plot_data$Upper_95 <- plot_data$Predicted + 1.96 * pred_se
+
+p6 <- plot_ly(plot_data) %>%
+  add_markers(x = ~Actual, y = ~Predicted,
+              marker = list(size = 8, opacity = 0.7, color = 'blue'),
+              name = 'Predictions',
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player)) %>%
+  add_lines(x = c(min(plot_data$Actual), max(plot_data$Actual)),
+            y = c(min(plot_data$Actual), max(plot_data$Actual)),
+            line = list(color = 'red', width = 2),
+            name = 'Perfect Prediction') %>%
+  add_ribbons(x = ~Actual,
+              ymin = ~Lower_95,
+              ymax = ~Upper_95,
+              line = list(color = 'transparent'),
+              fillcolor = 'rgba(100, 100, 100, 0.2)',
+              name = '95% Prediction Interval',
+              showlegend = TRUE) %>%
+  layout(title = 'Predictions with Confidence Intervals',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'))
+
+# 7. Interactive performance metrics display
+metrics_text <- paste(
+  "<b>Model Performance Metrics</b><br>",
+  "RMSE: ", round(sqrt(mean(plot_data$Residual^2)), 5), "<br>",
+  "MAE: ", round(mean(abs(plot_data$Residual)), 5), "<br>",
+  "R²: ", round(1 - sum(plot_data$Residual^2) / 
+                sum((plot_data$Actual - mean(plot_data$Actual))^2), 4), "<br>",
+  "Correlation: ", round(cor(plot_data$Actual, plot_data$Predicted), 4), "<br>",
+  "Mean Error: ", round(mean(plot_data$Residual), 5), "<br>",
+  "Std Error: ", round(sd(plot_data$Residual), 5), "<br><br>",
+  "<b>Test Set Info</b><br>",
+  "Number of players: ", nrow(plot_data), "<br>",
+  "Actual range: [", round(min(plot_data$Actual), 3), ", ", 
+                    round(max(plot_data$Actual), 3), "]<br>",
+  "Predicted range: [", round(min(plot_data$Predicted), 3), ", ", 
+                      round(max(plot_data$Predicted), 3), "]"
+)
+
+p7 <- plot_ly() %>%
+  add_annotations(
+    text = metrics_text,
+    x = 0.5, y = 0.5,
+    xref = "paper", yref = "paper",
+    showarrow = FALSE,
+    font = list(size = 14),
+    align = "left",
+    bgcolor = "white",
+    bordercolor = "black",
+    borderwidth = 2
+  ) %>%
+  layout(title = "Model Performance Summary",
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+# Display all plots
+cat("Interactive plots created! Use the following commands to view:\n")
+cat("1. p1 - Basic scatter plot\n")
+cat("2. p2 - Color by error magnitude\n")
+cat("3. p3 - Color by cluster/group\n")
+cat("4. p4 - Residuals plot\n")
+cat("5. p5 - 3D plot\n")
+cat("6. p6 - With confidence intervals\n")
+cat("7. p7 - Performance metrics\n\n")
+```
+
+```{r}
+p1
+```
+```{r}
+p2
+```
+```{r}
+p3
+```
+
+```{r}
+#p4
+```
+```{r}
+p5
+```
+
+```{r}
+p6
+```
+
+```{r}
+p7
+```
+
+
+```{r}
+htmltools::save_html(
+  htmltools::tagList(p1, p2, p3, p5, p6, p7),
+  file = "model_dashboard.html"
+)
+```
+
+```{r}
+test_index  <- setdiff(seq_len(nrow(per_min_data2)), train_index)
+
+# Build full_data from train/test
+full_data <- rbind(train_data, test_data)
+
+# Fit OLS model on training data
+full_ols_model <- lm(response ~ ., data = train_data)
+full_pred <- predict(full_ols_model, newdata = full_data)
+
+# Get actual values and residuals
+full_actual <- full_data$response
+full_residuals <- full_actual - full_pred
+full_abs_residuals <- abs(full_residuals)
+
+# Create base plot dataframe
+full_plot_data <- data.frame(
+  Actual      = full_actual,
+  Predicted   = full_pred,
+  Residual    = full_residuals,
+  Abs_Residual= full_abs_residuals
+)
+
+# Attach player names and clusters directly from per_min_data2
+full_plot_data$Player <- per_min_data2$PLAYER[c(train_index, test_index)]
+
+if("Cluster3Shooting_recordered" %in% names(per_min_data2)) {
+  full_plot_data$Cluster <- per_min_data2$Cluster3Shooting_recordered[c(train_index, test_index)]
+}
+
+# Add data split indicator using indices
+full_plot_data$Data_Split <- c(
+  rep("Training", length(train_index)),
+  rep("Test", length(test_index))
+)
+
+
+# Add cluster info if available
+if("Cluster3Shooting_recordered" %in% names(per_min_data2)) {
+  full_plot_data$Cluster <- per_min_data2$Cluster3Shooting_recordered
+}
+
+# Calculate metrics
+rmse_full <- sqrt(mean(full_plot_data$Residual^2))
+r2_full <- 1 - sum(full_plot_data$Residual^2) / 
+  sum((full_plot_data$Actual - mean(full_plot_data$Actual))^2)
+
+# P1: Actual vs Predicted (Full Dataset) - FIXED VERSION
+p1_full <- plot_ly() %>%
+  # Add scatter points
+  add_trace(data = full_plot_data, 
+            x = ~Actual, y = ~Predicted,
+            type = 'scatter', mode = 'markers',
+            color = ~Data_Split,
+            colors = c('blue', 'orange'),
+            marker = list(size = 8, opacity = 0.7),
+            hoverinfo = 'text',
+            text = ~paste('Player: ', Player,
+                         '<br>Split: ', Data_Split,
+                         '<br>Actual: ', round(Actual, 4),
+                         '<br>Predicted: ', round(Predicted, 4),
+                         '<br>Residual: ', round(Residual, 4)),
+            name = ~Data_Split) %>%
+  # Add perfect fit line (separate trace with its own data)
+  add_trace(x = c(min(full_plot_data$Actual), max(full_plot_data$Actual)), 
+            y = c(min(full_plot_data$Actual), max(full_plot_data$Actual)),
+            type = 'scatter', mode = 'lines',
+            line = list(color = 'red', width = 2, dash = 'solid'),
+            name = 'Perfect Fit',
+            showlegend = TRUE) %>%
+  layout(title = 'Actual vs Predicted (Full Dataset)',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'),
+         legend = list(x = 0.02, y = 0.98))
+
+# Add performance metrics annotation
+p1_full <- p1_full %>%
+  add_annotations(
+    text = paste("Full Dataset:<br>RMSE =", round(rmse_full, 5), 
+                "<br>R² =", round(r2_full, 4)),
+    x = 0.98, y = 0.02,
+    xref = "paper", yref = "paper",
+    showarrow = FALSE,
+    font = list(size = 12),
+    align = "right",
+    bgcolor = "rgba(255, 255, 255, 0.8)",
+    bordercolor = "black",
+    borderwidth = 1
+  )
+
+# P2: Color by residual magnitude (Full Dataset) - FIXED VERSION
+p2_full <- plot_ly() %>%
+  add_trace(data = full_plot_data, 
+            x = ~Actual, y = ~Predicted,
+            type = 'scatter', mode = 'markers',
+            marker = list(
+              size = 8, 
+              opacity = 0.8,
+              color = ~Abs_Residual,
+              colorscale = list(c(0, 1), c('lightblue', 'darkblue')),
+              showscale = TRUE,
+              colorbar = list(title = "|Error|")
+            ),
+            hoverinfo = 'text',
+            text = ~paste('Player: ', Player,
+                         '<br>Split: ', Data_Split,
+                         '<br>Actual: ', round(Actual, 4),
+                         '<br>Predicted: ', round(Predicted, 4),
+                         '<br>|Error|: ', round(Abs_Residual, 4)),
+            name = 'Predictions') %>%
+  add_trace(x = c(min(full_plot_data$Actual), max(full_plot_data$Actual)), 
+            y = c(min(full_plot_data$Actual), max(full_plot_data$Actual)),
+            type = 'scatter', mode = 'lines',
+            line = list(color = 'red', width = 2, dash = 'dash'),
+            name = 'Perfect Fit') %>%
+  layout(title = 'Colored by Error Magnitude (Full Dataset)',
+         xaxis = list(title = 'Actual 3PAPM'),
+         yaxis = list(title = 'Predicted 3PAPM'))
+
+# P5: Histogram of residuals (Full Dataset) - SIMPLER VERSION
+# Calculate histogram data manually
+p5_full <- plot_ly(full_plot_data, x = ~Actual, y = ~Predicted, z = ~Abs_Residual,
+              type = 'scatter3d', mode = 'markers',
+              marker = list(size = 5, opacity = 0.8,
+                           color = ~Abs_Residual,
+                           colorscale = 'blues'),
+              hoverinfo = 'text',
+              text = ~paste('Player: ', Player,
+                           '<br>Actual: ', round(Actual, 4),
+                           '<br>Predicted: ', round(Predicted, 4),
+                           '<br>|Error|: ', round(Abs_Residual, 4))) %>%
+  layout(title = '3D: Actual vs Predicted vs Error',
+         scene = list(
+           xaxis = list(title = 'Actual'),
+           yaxis = list(title = 'Predicted'),
+           zaxis = list(title = 'Absolute Error')
+         ))
+
+# Display the plots
+cat("=== FULL DATASET PLOTS ===\n")
+cat("Displaying p1_full...\n")
+p1_full
+
+cat("\nDisplaying p2_full...\n")
+p2_full
+
+cat("\nDisplaying p5_full...\n")
+p5_full
+
+# Create a simple comparison table in console
+cat("\n=== PERFORMANCE METRICS ===\n")
+cat(sprintf("%-15s %6s %10s %10s %8s\n", "Dataset", "N", "RMSE", "MAE", "R²"))
+cat(rep("-", 50), "\n")
+
+train_idx <- full_plot_data$Data_Split == "Training"
+test_idx <- full_plot_data$Data_Split == "Test"
+
+metrics <- data.frame(
+  Dataset = c("Training", "Test", "Full"),
+  N = c(sum(train_idx), sum(test_idx), nrow(full_plot_data)),
+  RMSE = c(
+    sqrt(mean(full_plot_data$Residual[train_idx]^2)),
+    sqrt(mean(full_plot_data$Residual[test_idx]^2)),
+    rmse_full
+  ),
+  MAE = c(
+    mean(abs(full_plot_data$Residual[train_idx])),
+    mean(abs(full_plot_data$Residual[test_idx])),
+    mean(abs(full_plot_data$Residual))
+  ),
+  R2 = c(
+    1 - sum(full_plot_data$Residual[train_idx]^2) / 
+      sum((full_plot_data$Actual[train_idx] - mean(full_plot_data$Actual[train_idx]))^2),
+    1 - sum(full_plot_data$Residual[test_idx]^2) / 
+      sum((full_plot_data$Actual[test_idx] - mean(full_plot_data$Actual[test_idx]))^2),
+    r2_full
+  )
+)
+
+for(i in 1:nrow(metrics)) {
+  cat(sprintf("%-15s %6d %10.5f %10.5f %8.4f\n", 
+              metrics$Dataset[i], 
+              metrics$N[i], 
+              metrics$RMSE[i], 
+              metrics$MAE[i], 
+              metrics$R2[i]))
+}
+
+# Save individual plots
+htmlwidgets::saveWidget(p1_full, "p1_full_dataset.html")
+htmlwidgets::saveWidget(p2_full, "p2_full_dataset.html")
+htmlwidgets::saveWidget(p5_full, "p5_full_dataset.html")
+
+cat("\nPlots saved as:\n")
+cat("1. p1_full_dataset.html\n")
+cat("2. p2_full_dataset.html\n")
+cat("3. p5_full_dataset.html\n")
+```
+
