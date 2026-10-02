@@ -1,0 +1,115 @@
+---
+title: "Untitled"
+author: "Jason Leff"
+date: "2026-03-26"
+output: html_document
+---
+
+```{r}
+rm(list=ls())
+data <- read.csv('data_with_pre_data.csv')
+set.seed(67)
+```
+
+# Normalize to Per Minute Data
+```{r}
+normalize_stats <- function(df) {
+  nba_start <- which(names(df) == "NBA_MIN") #split the data
+  nba_end   <- which(names(df) == "PRE_G")
+  
+  for (i in (nba_start+1):(nba_end-1)) {
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) { #divide total columns by minute column
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["NBA_MIN"]]),3)
+    }
+  }
+  pre_start <- which(names(df) == "PRE_MP")
+  for (i in (pre_start+1):ncol(df)) { #repeat for college
+    colname <- names(df)[i]
+    if (!grepl("PCT", colname, ignore.case = TRUE) && is.numeric(df[[colname]])) {
+      df[[colname]] <- round(as.numeric(df[[colname]]) / as.numeric(df[["PRE_MP"]]),3)
+    }
+  }
+  return(df)
+}
+per_min_data <- normalize_stats(data)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(plotly)
+
+data_filtered2 <- data %>%
+  filter(PRE_3PA >= 25 & PRE_FTA >= 25 & NBA_FG3A >= 25)
+
+clean_data <- na.omit(data_filtered2[c("PLAYER","NBA_FG3_PCT", "PRE_3P_PCT", "PRE_FT_PCT", "PRE_COL_or_INT")])
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+summary(model)
+
+# Create interactive 3D scatterplot with plotly
+plot_ly(clean_data, 
+        x = ~PRE_3P_PCT, 
+        y = ~PRE_FT_PCT, 
+        z = ~NBA_FG3_PCT,
+        color = ~PRE_COL_or_INT,
+        colors = rainbow(length(unique(clean_data$PRE_COL_or_INT))),
+        type = "scatter3d",
+        mode = "markers",
+        marker = list(size = 5),
+        text = ~PLAYER,
+        hoverinfo = "text+x+y+z") %>%
+  layout(title = "Colored by PRE_COL_OR_INT",
+         scene = list(xaxis = list(title = "Pre-3P%, >= 25 Attempts"),
+                      yaxis = list(title = "Pre-FT%, >= 25 Attempts"),
+                      zaxis = list(title = "NBA 3P%, >= 25 Attempts")))
+```
+
+```{r}
+model <- lm(NBA_FG3_PCT ~ PRE_3P_PCT + PRE_FT_PCT, data = clean_data)
+
+x_seq <- seq(min(clean_data$PRE_3P_PCT), max(clean_data$PRE_3P_PCT), length.out = 30)
+y_seq <- seq(min(clean_data$PRE_FT_PCT), max(clean_data$PRE_FT_PCT), length.out = 30)
+
+grid <- expand.grid(PRE_3P_PCT = x_seq, PRE_FT_PCT = y_seq)
+grid$NBA_FG3_PCT <- predict(model, newdata = grid)
+
+color_factor <- as.factor(clean_data$PRE_COL_or_INT)
+
+plot_ly() %>%
+  add_markers(
+    data = clean_data,
+    x = ~PRE_3P_PCT,
+    y = ~PRE_FT_PCT,
+    z = ~NBA_FG3_PCT,
+    color = color_factor,
+    marker = list(size = 4),
+    hoverinfo = "text",
+    text = ~paste(
+      "Name:", PLAYER,
+      "<br>Pre-3P%:", PRE_3P_PCT,
+      "<br>Pre-FT%:", PRE_FT_PCT,
+      "<br>NBA 3P%:", NBA_FG3_PCT,
+      "<br>Group:", PRE_COL_or_INT
+    )
+  ) %>%
+  add_surface(
+    x = x_seq,
+    y = y_seq,
+    z = matrix(grid$NBA_FG3_PCT, nrow = length(x_seq), ncol = length(y_seq)),
+    opacity = 0.5,
+    showscale = FALSE
+  ) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Pre-3P% (>= 25 Attempts)"),
+      yaxis = list(title = "Pre-FT% (>= 25 Attempts)"),
+      zaxis = list(title = "NBA 3P% (>= 25 Attempts)")
+    ),
+    title = "Interactive 3D Regression: NBA 3P% vs Pre-3P% & Pre-FT%"
+  )
+
+```
+
